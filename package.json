@@ -1,0 +1,142 @@
+{
+  "name": "aoh-git",
+  "displayName": "AOH - Git",
+  "description": "AOH - Rider-inspired Git workflow for VS Code.",
+  "version": "2.1.4",
+  "publisher": "Abyzz",
+  "icon": "media/aoh-logo-icon.png",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "extensionDependencies": [
+    "vscode.git"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aoh-git",
+          "title": "AOH - Git",
+          "icon": "media/git.svg"
+        }
+      ]
+    },
+    "views": {
+      "aoh-git": [
+        {
+          "type": "webview",
+          "id": "aoh.git.view",
+          "name": "Changes",
+          "icon": "media/git.svg",
+          "contextualTitle": "AOH - Git"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "aoh.git.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "aoh.git.selectBranch",
+        "title": "Switch / Create Branch",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "aoh.git.toggleViewMode",
+        "title": "Toggle Flat / Tree View",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "aoh.git.fetch",
+        "title": "Fetch",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "aoh.git.pull",
+        "title": "Pull",
+        "icon": "$(repo-pull)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "aoh.git.refresh",
+          "when": "view == aoh.git.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "aoh.git.fetch",
+          "when": "view == aoh.git.view",
+          "group": "navigation@2"
+        },
+        {
+          "command": "aoh.git.pull",
+          "when": "view == aoh.git.view",
+          "group": "navigation@3"
+        },
+        {
+          "command": "aoh.git.toggleViewMode",
+          "when": "view == aoh.git.view",
+          "group": "navigation@4"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AOH - Git",
+      "properties": {
+        "aoh.git.listItemSpacing": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 16,
+          "description": "Additional vertical spacing between changed-file rows in pixels."
+        },
+        "aoh.git.confirmPush": {
+          "type": "boolean",
+          "default": false,
+          "description": "Ask for confirmation before Commit & Push."
+        },
+        "aoh.git.ai.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable AI-assisted commit message generation."
+        },
+        "aoh.git.ai.command": {
+          "type": "string",
+          "default": "codex",
+          "description": "Executable used for AI commit message generation. Any CLI that writes the generated message to stdout can be used."
+        },
+        "aoh.git.ai.arguments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "exec",
+            "--color",
+            "never",
+            "-"
+          ],
+          "markdownDescription": "Arguments passed to the AI command. Use `{Context}` and `{Diff}` placeholders anywhere in an argument. If neither placeholder is used, AOH sends context and diff to stdin."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.96.0",
+    "typescript": "^5.7.2"
+  }
+}

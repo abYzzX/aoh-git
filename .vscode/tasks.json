@@ -1,0 +1,60 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "compile: all",
+      "dependsOrder": "parallel",
+      "dependsOn": [
+        "compile: adjust-namespaces",
+        "compile: method-brackets",
+        "compile: nuget",
+        "compile: git",
+        "compile: run-selector",
+        "compile: solution-explorer"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "compile: adjust-namespaces",
+      "type": "npm",
+      "script": "compile",
+      "path": "aoh-csharp-adjust-namespaces",
+      "problemMatcher": "$tsc"
+    },
+    {
+      "label": "compile: method-brackets",
+      "type": "npm",
+      "script": "compile",
+      "path": "aoh-csharp-method-brackets",
+      "problemMatcher": "$tsc"
+    },
+    {
+      "label": "compile: nuget",
+      "type": "npm",
+      "script": "compile",
+      "path": "aoh-csharp-nuget",
+      "problemMatcher": "$tsc"
+    },
+    {
+      "label": "compile: git",
+      "type": "npm",
+      "script": "compile",
+      "path": "aoh-git",
+      "problemMatcher": "$tsc"
+    },
+    {
+      "label": "compile: run-selector",
+      "type": "npm",
+      "script": "compile",
+      "path": "aoh-run-selector",
+      "problemMatcher": "$tsc"
+    },
+    {
+      "label": "compile: solution-explorer",
+      "type": "npm",
+      "script": "compile",
+      "path": "aoh-solution-explorer",
+      "problemMatcher": "$tsc"
+    }
+  ]
+}

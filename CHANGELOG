@@ -1,0 +1,23 @@
+# Changelog
+
+All notable changes to AOH Git will be documented in this file.
+
+## 2.1.4
+
+- Added repository header with branch and ahead/behind information.
+- Added branch management directly from the Git view.
+- Added separate Staged Changes and Changes sections.
+- Added support for staging and unstaging individual files or groups of files.
+- Added flat and tree-based file views.
+- Added Git status coloring for changed files.
+- Added double-click support for opening file diffs.
+- Added integrated commit message editor.
+- Added Commit and Commit & Push actions.
+- Added optional AI-assisted commit message generation.
+- Added rollback support for tracked, staged, and untracked changes with confirmation.
+- Added support for multiple repositories in a workspace.
+- Improved layout and configurable spacing throughout the Git view.
+
+## Earlier versions
+
+Earlier development versions were created during the initial development of AOH Git and are not documented individually.
