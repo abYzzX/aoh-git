@@ -6,6 +6,10 @@ It provides a dedicated Git view with repository state, branch operations, stagi
 
 ## Features
 
+- Dedicated Changes and Stashes tabs
+- Stash creation with optional messages and untracked-file support
+- Expandable stash contents with file-level diff inspection
+- Apply, pop, and drop stash actions
 - Multiple Git repositories in a workspace
 - Current branch and ahead/behind information
 - Tree and flat views for changed files

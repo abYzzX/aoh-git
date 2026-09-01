@@ -2,6 +2,17 @@
 
 All notable changes to AOH Git will be documented in this file.
 
+## 2.2.0
+
+- Added a dedicated **Stashes** tab to the AOH Git view.
+- Added stash creation with an optional message and **Include untracked files** option.
+- Added expandable stash entries showing the files contained in each stash.
+- Added file status, path, file count, stash reference, and timestamp information.
+- Added double-click stash file inspection using Git-backed diffs.
+- Added **Apply**, **Pop**, and **Drop** actions for individual stashes.
+- Added confirmation before permanently dropping a stash.
+- Added multi-repository stash support.
+
 ## 2.1.4
 
 - Added repository header with branch and ahead/behind information.

@@ -90,6 +90,9 @@ type WebMessage =
     | { type: 'branchAction'; repo: string; action: 'checkout' | 'checkoutRemote' | 'create' | 'createFrom' | 'merge' | 'delete' | 'deleteRemote' | 'pull' | 'fetch' | 'push'; branch?: string; remote?: string; remoteBranch?: string }
     | { type: 'toggleViewMode' }
     | { type: 'rollback'; repo: string; files: string[] }
+    | { type: 'createStash'; repo: string; message: string; includeUntracked: boolean }
+    | { type: 'stashAction'; repo: string; action: 'apply' | 'pop' | 'drop'; ref: string }
+    | { type: 'stashDiff'; repo: string; ref: string; file: string; untracked: boolean }
     | { type: 'debug'; message: string };
 
 export function activate(context: vscode.ExtensionContext) {
@@ -282,7 +285,8 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 behind: repo.state.HEAD?.behind ?? 0,
                 hasUpstream: !!repo.state.HEAD?.upstream,
                 staged: repo.state.indexChanges.map(c => this.serializeChange(root, c)),
-                unstaged: unstaged.map(c => this.serializeChange(root, c))
+                unstaged: unstaged.map(c => this.serializeChange(root, c)),
+                stashes: await this.readStashes(root)
             };
         }));
 
@@ -330,6 +334,66 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             tooltip: this.statusLabel(change.status),
             status: change.status
         };
+    }
+
+    private async readStashes(root: string) {
+        try {
+            const { stdout } = await execFileAsync(
+                'git',
+                ['stash', 'list', '--format=%gd%x1f%H%x1f%ct%x1f%gs'],
+                { cwd: root, maxBuffer: 10 * 1024 * 1024 }
+            );
+
+            const entries = stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+            return await Promise.all(entries.map(async line => {
+                const [ref, hash, timestamp, ...messageParts] = line.split('\x1f');
+                const message = messageParts.join('\x1f');
+                const untracked = new Set<string>();
+
+                try {
+                    const { stdout: untrackedStdout } = await execFileAsync(
+                        'git',
+                        ['ls-tree', '-r', '--name-only', `${ref}^3`],
+                        { cwd: root, maxBuffer: 10 * 1024 * 1024 }
+                    );
+                    for (const file of untrackedStdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
+                        untracked.add(file);
+                    }
+                } catch {
+                    // A stash only has a third parent when untracked files were included.
+                }
+
+                const { stdout: filesStdout } = await execFileAsync(
+                    'git',
+                    ['stash', 'show', '--include-untracked', '--name-status', '--format=', '--no-renames', ref],
+                    { cwd: root, maxBuffer: 10 * 1024 * 1024 }
+                );
+
+                const files = filesStdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean).map(value => {
+                    const tab = value.indexOf('\t');
+                    const status = tab >= 0 ? value.slice(0, tab) : 'M';
+                    const relativePath = tab >= 0 ? value.slice(tab + 1) : value;
+                    return {
+                        path: relativePath,
+                        name: path.basename(relativePath),
+                        dir: path.dirname(relativePath) === '.' ? '' : path.dirname(relativePath),
+                        status,
+                        untracked: untracked.has(relativePath)
+                    };
+                });
+
+                return {
+                    ref,
+                    hash,
+                    timestamp: Number(timestamp) || 0,
+                    message,
+                    files
+                };
+            }));
+        } catch (err) {
+            this.output.appendLine(`[stash] Failed to enumerate stashes for ${root}: ${this.errorText(err)}`);
+            return [];
+        }
     }
 
     private statusLabel(status: Status): string {
@@ -422,6 +486,15 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 case 'rollback':
                     await this.rollback(repo, message.files);
                     break;
+                case 'createStash':
+                    await this.createStash(repo, message.message, message.includeUntracked);
+                    break;
+                case 'stashAction':
+                    await this.handleStashAction(repo, message.action, message.ref);
+                    break;
+                case 'stashDiff':
+                    await this.openStashDiff(repo, message.ref, message.file, message.untracked);
+                    break;
                 case 'generateCommitMessage':
                     await this.generateCommitMessage(repo);
                     break;
@@ -438,6 +511,49 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             const text = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(`AOH - Git: ${text}`);
         }
+    }
+
+    private async createStash(repo: Repository, message: string, includeUntracked: boolean): Promise<void> {
+        const args = ['stash', 'push'];
+        if (includeUntracked) args.push('--include-untracked');
+        if (message.trim()) args.push('-m', message.trim());
+
+        this.output.appendLine(`[stash] Creating stash in ${repo.rootUri.fsPath}; includeUntracked=${includeUntracked}`);
+        await execFileAsync('git', args, { cwd: repo.rootUri.fsPath, maxBuffer: 10 * 1024 * 1024 });
+    }
+
+    private async handleStashAction(repo: Repository, action: 'apply' | 'pop' | 'drop', ref: string): Promise<void> {
+        if (action === 'drop') {
+            const confirmed = await vscode.window.showWarningMessage(
+                `Drop ${ref}? This permanently deletes the stash.`,
+                { modal: true },
+                'Drop Stash'
+            );
+            if (confirmed !== 'Drop Stash') return;
+        }
+
+        this.output.appendLine(`[stash] ${action} ${ref} in ${repo.rootUri.fsPath}`);
+        try {
+            await execFileAsync('git', ['stash', action, ref], { cwd: repo.rootUri.fsPath, maxBuffer: 10 * 1024 * 1024 });
+        } finally {
+            await repo.status();
+            await this.refresh();
+        }
+    }
+
+    private async openStashDiff(repo: Repository, ref: string, relativePath: string, untracked: boolean): Promise<void> {
+        const uri = vscode.Uri.file(path.join(repo.rootUri.fsPath, relativePath));
+        const title = `${path.basename(relativePath)} (${ref})`;
+
+        if (untracked) {
+            const right = this.api!.toGitUri(uri, `${ref}^3`);
+            await vscode.commands.executeCommand('vscode.open', right, { preview: true });
+            return;
+        }
+
+        const left = this.api!.toGitUri(uri, `${ref}^1`);
+        const right = this.api!.toGitUri(uri, ref);
+        await vscode.commands.executeCommand('vscode.diff', left, right, title);
     }
 
     private async rollback(repo: Repository, files: string[]): Promise<void> {
@@ -1080,6 +1196,64 @@ body {
 }
 
 .branch-action.disabled { opacity: .45; pointer-events: none; }
+.tabs {
+    flex: 0 0 auto;
+    display: flex;
+    padding: 0 8px;
+    border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border);
+}
+.tab {
+    appearance: none;
+    min-height: 32px;
+    padding: 0 10px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+}
+.tab:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
+.tab.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+.stash-create {
+    margin: 8px 5px 12px;
+    padding: 8px;
+    border: 1px solid var(--vscode-sideBarSectionHeader-border);
+    border-radius: 4px;
+}
+.stash-create-row { display: flex; gap: 6px; }
+.stash-message {
+    flex: 1;
+    min-width: 0;
+    height: 28px;
+    padding: 4px 7px;
+    border: 1px solid var(--vscode-input-border, transparent);
+    border-radius: 3px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    font: inherit;
+    outline: none;
+}
+.stash-message:focus { border-color: var(--vscode-focusBorder); }
+.stash-create-button { min-height: 28px; padding: 0 10px; }
+.stash-options { margin-top: 7px; color: var(--vscode-descriptionForeground); font-size: .9em; }
+.stash-options label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.stash-card { margin: 8px 5px; border: 1px solid var(--vscode-sideBarSectionHeader-border); border-radius: 4px; overflow: hidden; }
+.stash-summary { display: flex; align-items: center; gap: 7px; min-height: 32px; padding: 4px 7px; cursor: pointer; list-style: none; }
+.stash-summary::-webkit-details-marker { display: none; }
+.stash-summary::before { content: '▸'; width: 12px; color: var(--vscode-descriptionForeground); }
+.stash-card[open] > .stash-summary::before { content: '▾'; }
+.stash-summary:hover { background: var(--vscode-list-hoverBackground); }
+.stash-title { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stash-ref { color: var(--vscode-descriptionForeground); font-size: .9em; }
+.stash-actions { display: flex; gap: 4px; padding: 6px 7px; border-top: 1px solid var(--vscode-sideBarSectionHeader-border); }
+.stash-action { min-height: 25px; padding: 0 8px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+.stash-files { border-top: 1px solid var(--vscode-sideBarSectionHeader-border); padding: 4px 0; }
+.stash-file { display: flex; align-items: baseline; gap: 8px; min-height: 26px; padding: 3px 8px; cursor: pointer; }
+.stash-file:hover { background: var(--vscode-list-hoverBackground); }
+.stash-status { width: 14px; flex: 0 0 14px; color: var(--vscode-descriptionForeground); font-weight: 600; }
+.stash-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stash-file-dir { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: .9em; }
+.stash-meta { color: var(--vscode-descriptionForeground); font-size: .85em; white-space: nowrap; }
 .group { margin-top: 8px; }
 .group-title {
     display: flex;
@@ -1309,6 +1483,10 @@ button:disabled { opacity: .55; cursor: default; }
 </head>
 <body>
 <div id="app">
+    <div class="tabs">
+        <button id="changesTab" class="tab active">Changes</button>
+        <button id="stashesTab" class="tab">Stashes</button>
+    </div>
     <div id="repos"><div class="empty">Loading Git repositories…</div></div>
     <div class="commit-area">
         <div class="message-wrap">
@@ -1337,10 +1515,14 @@ const commitPush = document.getElementById('commitPush');
 const generateCommitMessage = document.getElementById('generateCommitMessage');
 const contextMenu = document.getElementById('contextMenu');
 const rollbackContext = document.getElementById('rollbackContext');
+const changesTab = document.getElementById('changesTab');
+const stashesTab = document.getElementById('stashesTab');
+const commitArea = document.querySelector('.commit-area');
 
 let contextTarget = null;
 let state = { repositories: [], aiEnabled: false };
 let activeRepo = '';
+let activeTab = 'changes';
 
 function debug(message) {
     vscode.postMessage({ type: 'debug', message: String(message) });
@@ -1385,6 +1567,9 @@ function showRollbackMenu(event, repo, files) {
 
 function render() {
     document.documentElement.style.setProperty('--list-item-spacing', (state.listItemSpacing ?? 2) + 'px');
+    changesTab.classList.toggle('active', activeTab === 'changes');
+    stashesTab.classList.toggle('active', activeTab === 'stashes');
+    commitArea.style.display = activeTab === 'changes' ? '' : 'none';
 
     if (!state.repositories.length) {
         repos.innerHTML = '<div class="empty">No Git repository found in this workspace.</div>';
@@ -1400,26 +1585,134 @@ function render() {
     generateCommitMessage.style.display = state.aiEnabled ? '' : 'none';
     generateCommitMessage.disabled = !state.aiEnabled;
 
-    repos.innerHTML = state.repositories.map(repo => {
-        const branchInfo = repo.branch +
-            (repo.ahead ? ' ↑' + repo.ahead : '') +
-            (repo.behind ? ' ↓' + repo.behind : '');
-
-        const staged = renderGroup(repo, 'Staged', repo.staged, true);
-        const unstaged = renderGroup(repo, 'Changes', repo.unstaged, false);
-
-        return '<section class="repo" data-repo="' + esc(repo.root) + '">' +
-            '<div class="repo-header"><span class="repo-title">' + esc(repo.name) + '</span>' +
-            '<div class="branch-wrap"><span class="branch" title="Branch actions" data-repo="' + esc(repo.root) + '">' + esc(branchInfo) + ' ▾</span>' +
-            renderBranchMenu(repo) + '</div></div>' +
-            staged + unstaged +
-            '</section>';
-    }).join('');
+    repos.innerHTML = activeTab === 'changes'
+      ? state.repositories.map(renderChangesRepository).join('')
+      : state.repositories.map(renderStashRepository).join('');
 
     document.querySelectorAll('.repo').forEach(el => {
         el.addEventListener('mousedown', () => activeRepo = el.dataset.repo || '');
     });
 
+    if (activeTab === 'stashes') {
+        bindStashEvents();
+        return;
+    }
+
+    bindChangeEvents();
+}
+
+function renderChangesRepository(repo) {
+    const branchInfo = repo.branch +
+        (repo.ahead ? ' ↑' + repo.ahead : '') +
+        (repo.behind ? ' ↓' + repo.behind : '');
+    const staged = renderGroup(repo, 'Staged', repo.staged, true);
+    const unstaged = renderGroup(repo, 'Changes', repo.unstaged, false);
+
+    return '<section class="repo" data-repo="' + esc(repo.root) + '">' +
+        '<div class="repo-header"><span class="repo-title">' + esc(repo.name) + '</span>' +
+        '<div class="branch-wrap"><span class="branch" title="Branch actions" data-repo="' + esc(repo.root) + '">' + esc(branchInfo) + ' ▾</span>' +
+        renderBranchMenu(repo) + '</div></div>' +
+        staged + unstaged +
+        '</section>';
+}
+
+function renderStashRepository(repo) {
+    const stashes = repo.stashes || [];
+    const stashHtml = stashes.length
+      ? stashes.map(stash => renderStash(repo, stash)).join('')
+      : '<div class="empty">No stashes in this repository.</div>';
+
+    return '<section class="repo" data-repo="' + esc(repo.root) + '">' +
+      '<div class="repo-header"><span class="repo-title">' + esc(repo.name) + '</span>' +
+      '<span class="stash-ref">' + stashes.length + ' stash' + (stashes.length === 1 ? '' : 'es') + '</span></div>' +
+      '<div class="stash-create">' +
+        '<div class="stash-create-row">' +
+          '<input class="stash-message" data-repo="' + esc(repo.root) + '" placeholder="Stash message (optional)">' +
+          '<button class="stash-create-button primary" data-repo="' + esc(repo.root) + '">Stash</button>' +
+        '</div>' +
+        '<div class="stash-options"><label><input class="stash-untracked" data-repo="' + esc(repo.root) + '" type="checkbox"> Include untracked files</label></div>' +
+      '</div>' + stashHtml + '</section>';
+}
+
+function renderStash(repo, stash) {
+    const date = stash.timestamp ? new Date(stash.timestamp * 1000).toLocaleString() : '';
+    const files = stash.files || [];
+    const fileRows = files.length ? files.map(file =>
+      '<div class="stash-file" data-repo="' + esc(repo.root) + '" data-ref="' + esc(stash.ref) + '" data-file="' + esc(file.path) + '" data-untracked="' + (file.untracked ? 'true' : 'false') + '" title="Open stash diff">' +
+        '<span class="stash-status">' + esc(file.status) + '</span>' +
+        '<span class="stash-file-name">' + esc(file.name) + '</span>' +
+        (file.dir ? '<span class="stash-file-dir">' + esc(file.dir) + '</span>' : '') +
+      '</div>'
+    ).join('') : '<div class="empty">No changed files.</div>';
+
+    return '<details class="stash-card">' +
+      '<summary class="stash-summary">' +
+        '<span class="stash-title">' + esc(stash.message || stash.ref) + '</span>' +
+        '<span class="stash-meta">' + files.length + ' file' + (files.length === 1 ? '' : 's') + '</span>' +
+        '<span class="stash-ref">' + esc(stash.ref) + '</span>' +
+      '</summary>' +
+      '<div class="stash-files">' + fileRows + '</div>' +
+      '<div class="stash-actions">' +
+        '<button class="stash-action" data-action="apply" data-repo="' + esc(repo.root) + '" data-ref="' + esc(stash.ref) + '">Apply</button>' +
+        '<button class="stash-action" data-action="pop" data-repo="' + esc(repo.root) + '" data-ref="' + esc(stash.ref) + '">Pop</button>' +
+        '<button class="stash-action" data-action="drop" data-repo="' + esc(repo.root) + '" data-ref="' + esc(stash.ref) + '">Drop</button>' +
+        '<span class="stash-meta" style="margin-left:auto;align-self:center">' + esc(date) + '</span>' +
+      '</div>' +
+    '</details>';
+}
+
+function bindStashEvents() {
+    document.querySelectorAll('.stash-create-button').forEach(button => {
+        button.addEventListener('click', () => createStash(button.dataset.repo));
+    });
+    document.querySelectorAll('.stash-message').forEach(input => {
+        input.addEventListener('keydown', event => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                createStash(input.dataset.repo);
+            }
+        });
+    });
+    document.querySelectorAll('.stash-action').forEach(button => {
+        button.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            vscode.postMessage({
+                type: 'stashAction',
+                repo: button.dataset.repo,
+                action: button.dataset.action,
+                ref: button.dataset.ref
+            });
+        });
+    });
+    document.querySelectorAll('.stash-file').forEach(file => {
+        file.addEventListener('dblclick', event => {
+            event.preventDefault();
+            vscode.postMessage({
+                type: 'stashDiff',
+                repo: file.dataset.repo,
+                ref: file.dataset.ref,
+                file: file.dataset.file,
+                untracked: file.dataset.untracked === 'true'
+            });
+        });
+    });
+}
+
+function createStash(repo) {
+    const section = document.querySelector('.repo[data-repo="' + CSS.escape(repo) + '"]');
+    if (!section) return;
+    const input = section.querySelector('.stash-message');
+    const untracked = section.querySelector('.stash-untracked');
+    vscode.postMessage({
+        type: 'createStash',
+        repo,
+        message: input?.value || '',
+        includeUntracked: !!untracked?.checked
+    });
+}
+
+function bindChangeEvents() {
     document.querySelectorAll('.file-row').forEach(el => {
         el.addEventListener('contextmenu', event => {
             const file = el.querySelector('.file-main');
@@ -1434,19 +1727,6 @@ function render() {
             if (!input) return;
             const files = JSON.parse(input.dataset.files || '[]');
             showRollbackMenu(event, input.dataset.repo, files);
-        });
-    });
-
-    document.querySelectorAll('.file-main').forEach(el => {
-        el.addEventListener('dblclick', event => {
-            event.stopPropagation();
-            const file = event.currentTarget;
-            vscode.postMessage({
-                type: 'diff',
-                repo: file.dataset.repo,
-                file: file.dataset.file,
-                staged: file.dataset.staged === 'true'
-            });
         });
     });
 
@@ -1483,12 +1763,7 @@ function render() {
             event.stopPropagation();
             const push = event.currentTarget;
             document.querySelectorAll('.branch-menu').forEach(menu => menu.classList.add('hidden'));
-            vscode.postMessage({
-                type: 'branchAction',
-                repo: push.dataset.repo,
-                action: 'push',
-                remote: push.dataset.remote || undefined
-            });
+            vscode.postMessage({ type: 'branchAction', repo: push.dataset.repo, action: 'push', remote: push.dataset.remote || undefined });
         });
     });
 
@@ -1499,11 +1774,8 @@ function render() {
             if (action.classList.contains('disabled')) return;
             document.querySelectorAll('.branch-menu').forEach(menu => menu.classList.add('hidden'));
             vscode.postMessage({
-                type: 'branchAction',
-                repo: action.dataset.repo,
-                action: action.dataset.action,
-                branch: action.dataset.branch || undefined,
-                remote: action.dataset.remote || undefined,
+                type: 'branchAction', repo: action.dataset.repo, action: action.dataset.action,
+                branch: action.dataset.branch || undefined, remote: action.dataset.remote || undefined,
                 remoteBranch: action.dataset.remoteBranch || undefined
             });
         });
@@ -1512,27 +1784,16 @@ function render() {
     document.querySelectorAll('.file-check').forEach(el => {
         el.addEventListener('change', event => {
             const input = event.currentTarget;
-            vscode.postMessage({
-                type: input.checked ? 'stage' : 'unstage',
-                repo: input.dataset.repo,
-                file: input.dataset.file
-            });
+            vscode.postMessage({ type: input.checked ? 'stage' : 'unstage', repo: input.dataset.repo, file: input.dataset.file });
         });
     });
 
-
-    document.querySelectorAll('.folder-check').forEach(el => {
-        el.addEventListener('click', event => event.stopPropagation());
-    });
+    document.querySelectorAll('.folder-check').forEach(el => el.addEventListener('click', event => event.stopPropagation()));
     document.querySelectorAll('.group-check, .folder-check').forEach(el => {
         el.addEventListener('change', event => {
             const input = event.currentTarget;
             const files = JSON.parse(input.dataset.files || '[]');
-            vscode.postMessage({
-                type: input.checked ? 'stageAll' : 'unstageAll',
-                repo: input.dataset.repo,
-                files
-            });
+            vscode.postMessage({ type: input.checked ? 'stageAll' : 'unstageAll', repo: input.dataset.repo, files });
         });
     });
 
@@ -1541,11 +1802,8 @@ function render() {
             event.stopPropagation();
             const row = event.currentTarget;
             vscode.postMessage({
-                type: 'diff',
-                repo: row.dataset.repo,
-                file: row.dataset.file,
-                staged: row.dataset.staged === 'true',
-                status: Number(row.dataset.status)
+                type: 'diff', repo: row.dataset.repo, file: row.dataset.file,
+                staged: row.dataset.staged === 'true', status: Number(row.dataset.status)
             });
         });
     });
@@ -1820,6 +2078,9 @@ window.addEventListener('message', event => {
         }
     }
 });
+
+changesTab.addEventListener('click', () => { activeTab = 'changes'; render(); });
+stashesTab.addEventListener('click', () => { activeTab = 'stashes'; render(); });
 
 vscode.postMessage({ type: 'ready' });
 </script>
