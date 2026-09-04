@@ -76,15 +76,11 @@ interface GitExtension {
 
 type WebMessage =
     | { type: 'ready' }
-    | { type: 'stage'; repo: string; file: string }
-    | { type: 'unstage'; repo: string; file: string }
-    | { type: 'stageAll'; repo: string; files: string[] }
-    | { type: 'unstageAll'; repo: string; files: string[] }
     | { type: 'open'; repo: string; file: string }
     | { type: 'diff'; repo: string; file: string; staged: boolean; status: Status }
-    | { type: 'commit'; repo: string; message: string }
-    | { type: 'commitPush'; repo: string; message: string }
-    | { type: 'generateCommitMessage'; repo: string }
+    | { type: 'commit'; repo: string; message: string; files: string[] }
+    | { type: 'commitPush'; repo: string; message: string; files: string[] }
+    | { type: 'generateCommitMessage'; repo: string; files: string[] }
     | { type: 'refresh' }
     | { type: 'selectBranch'; repo: string }
     | { type: 'branchAction'; repo: string; action: 'checkout' | 'checkoutRemote' | 'create' | 'createFrom' | 'merge' | 'delete' | 'deleteRemote' | 'pull' | 'fetch' | 'push'; branch?: string; remote?: string; remoteBranch?: string }
@@ -214,11 +210,22 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
 
             const repositoryStates = await Promise.all(repositories.map(async repo => {
             const root = repo.rootUri.fsPath;
-            const unstaged = this.dedupe([
+            const allChanges = this.dedupe([
                 ...repo.state.workingTreeChanges,
-                ...repo.state.untrackedChanges,
-                ...repo.state.mergeChanges
+                ...repo.state.mergeChanges,
+                ...repo.state.indexChanges,
+                ...repo.state.untrackedChanges
             ]);
+
+            // Some versions of VS Code's built-in Git extension expose untracked files
+            // only through workingTreeChanges. Classify by Git status instead of relying
+            // on the optional untrackedChanges collection so the Tracked / Untracked
+            // split remains correct.
+            const untracked = allChanges.filter(change => change.status === Status.UNTRACKED);
+            const tracked = allChanges.filter(change => change.status !== Status.UNTRACKED);
+            const stagedFiles = repo.state.indexChanges.map(change => change.uri.fsPath);
+            const stagedPathSet = new Set(stagedFiles.map(file => path.normalize(file)));
+            const workingPathSet = new Set([...repo.state.workingTreeChanges, ...repo.state.mergeChanges, ...repo.state.untrackedChanges].map(change => path.normalize(change.uri.fsPath)));
 
             let branches: string[] = [];
             let remotes: Array<{ name: string; branches: string[] }> = [];
@@ -284,8 +291,9 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 ahead: repo.state.HEAD?.ahead ?? 0,
                 behind: repo.state.HEAD?.behind ?? 0,
                 hasUpstream: !!repo.state.HEAD?.upstream,
-                staged: repo.state.indexChanges.map(c => this.serializeChange(root, c)),
-                unstaged: unstaged.map(c => this.serializeChange(root, c)),
+                tracked: tracked.map(c => ({ ...this.serializeChange(root, c), stagedOnly: stagedPathSet.has(path.normalize(c.uri.fsPath)) && !workingPathSet.has(path.normalize(c.uri.fsPath)) })),
+                untracked: untracked.map(c => ({ ...this.serializeChange(root, c), stagedOnly: false })),
+                stagedFiles,
                 stashes: await this.readStashes(root)
             };
         }));
@@ -396,6 +404,18 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
+    private untrackedPathSet(repo: Repository): Set<string> {
+        return new Set(
+            [
+                ...repo.state.workingTreeChanges,
+                ...repo.state.mergeChanges,
+                ...repo.state.untrackedChanges
+            ]
+                .filter(change => change.status === Status.UNTRACKED)
+                .map(change => path.normalize(change.uri.fsPath))
+        );
+    }
+
     private statusLabel(status: Status): string {
         switch (status) {
             case Status.MODIFIED:
@@ -450,18 +470,6 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
 
         try {
             switch (message.type) {
-                case 'stage':
-                    await repo.add([message.file]);
-                    break;
-                case 'unstage':
-                    await repo.restore([message.file], { staged: true });
-                    break;
-                case 'stageAll':
-                    if (message.files.length) await repo.add(message.files);
-                    break;
-                case 'unstageAll':
-                    if (message.files.length) await repo.restore(message.files, { staged: true });
-                    break;
                 case 'open':
                     await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(message.file));
                     break;
@@ -496,13 +504,13 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                     await this.openStashDiff(repo, message.ref, message.file, message.untracked);
                     break;
                 case 'generateCommitMessage':
-                    await this.generateCommitMessage(repo);
+                    await this.generateCommitMessage(repo, message.files);
                     break;
                 case 'commit':
-                    await this.commit(repo, message.message, false);
+                    await this.commit(repo, message.message, false, message.files);
                     break;
                 case 'commitPush':
-                    await this.commit(repo, message.message, true);
+                    await this.commit(repo, message.message, true, message.files);
                     break;
             }
             await repo.status();
@@ -574,7 +582,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         }
 
         const root = repo.rootUri.fsPath;
-        const untracked = new Set(repo.state.untrackedChanges.map(change => path.normalize(change.uri.fsPath)));
+        const untracked = this.untrackedPathSet(repo);
         const untrackedFiles = uniqueFiles.filter(file => untracked.has(path.normalize(file)));
         const trackedFiles = uniqueFiles.filter(file => !untracked.has(path.normalize(file)));
 
@@ -803,22 +811,19 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                     break;
 
                 case 'push': {
-                    if (remote) {
-                        if (!current) {
-                            vscode.window.showWarningMessage('AOH - Git: cannot push a detached HEAD.');
-                            return;
-                        }
+                    const pushTarget = await this.resolvePushTarget(repo, remote);
+                    if (!pushTarget) return;
 
-                        const hasUpstream = !!repo.state.HEAD?.upstream;
-                        const args = ['push'];
-                        if (!hasUpstream) {
-                            args.push('--set-upstream');
-                        }
-                        args.push(remote, current);
-                        await execFileAsync('git', args, { cwd });
+                    if (pushTarget.publish) {
+                        await execFileAsync(
+                            'git',
+                            ['push', '--set-upstream', pushTarget.remote, pushTarget.branch],
+                            { cwd }
+                        );
+                    } else if (remote) {
+                        await execFileAsync('git', ['push', remote, pushTarget.branch], { cwd });
                     } else {
-                        const hasUpstream = !!repo.state.HEAD?.upstream;
-                        await repo.push(undefined, undefined, !hasUpstream);
+                        await repo.push();
                     }
                     break;
                 }
@@ -830,6 +835,51 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             const text = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(`AOH - Git: ${text}`);
         }
+    }
+
+    private async resolvePushTarget(
+        repo: Repository,
+        requestedRemote?: string
+    ): Promise<{ branch: string; remote: string; publish: boolean } | undefined> {
+        const branch = repo.state.HEAD?.name;
+        if (!branch) {
+            vscode.window.showWarningMessage('AOH - Git: cannot push a detached HEAD.');
+            return undefined;
+        }
+
+        const upstream = repo.state.HEAD?.upstream;
+        if (upstream) {
+            return {
+                branch,
+                remote: requestedRemote ?? upstream.remote,
+                publish: false
+            };
+        }
+
+        let remote = requestedRemote;
+        if (!remote) {
+            try {
+                const { stdout } = await execFileAsync('git', ['remote'], { cwd: repo.rootUri.fsPath });
+                const remotes = stdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+                remote = remotes.includes('origin') ? 'origin' : remotes[0];
+            } catch {
+                remote = undefined;
+            }
+        }
+
+        if (!remote) {
+            vscode.window.showWarningMessage('AOH - Git: no remote is configured for this repository.');
+            return undefined;
+        }
+
+        const answer = await vscode.window.showInformationMessage(
+            `The branch "${branch}" has no remote branch. Publish this branch?`,
+            { modal: true },
+            'Publish Branch'
+        );
+        if (answer !== 'Publish Branch') return undefined;
+
+        return { branch, remote, publish: true };
     }
 
     private async localBranchExists(cwd: string, branch: string): Promise<boolean> {
@@ -853,15 +903,15 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         return name?.trim() || undefined;
     }
 
-    private async generateCommitMessage(repo: Repository): Promise<void> {
+    private async generateCommitMessage(repo: Repository, files: string[]): Promise<void> {
         const config = vscode.workspace.getConfiguration('aoh.git');
         if (!config.get<boolean>('ai.enabled', false)) {
             vscode.window.showInformationMessage('AOH - Git: AI support is disabled. Enable aoh.git.ai.enabled first.');
             return;
         }
 
-        if (!repo.state.indexChanges.length) {
-            vscode.window.showWarningMessage('No staged changes. Stage something before generating a commit message.');
+        if (!files.length) {
+            vscode.window.showWarningMessage('Select at least one file before generating a commit message.');
             return;
         }
 
@@ -874,10 +924,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         try {
             const cwd = repo.rootUri.fsPath;
             const [{ stdout: diff }, { stdout: history }] = await Promise.all([
-                execFileAsync('git', ['diff', '--cached', '--no-ext-diff', '--unified=3'], {
-                    cwd,
-                    maxBuffer: 4 * 1024 * 1024
-                }),
+                this.diffForFiles(repo, files),
                 execFileAsync('git', ['log', '-8', '--pretty=%s'], {
                     cwd,
                     maxBuffer: 512 * 1024
@@ -886,7 +933,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
 
             const cleanDiff = String(diff).trim();
             if (!cleanDiff) {
-                vscode.window.showWarningMessage('The staged diff is empty.');
+                vscode.window.showWarningMessage('The selected diff is empty.');
                 return;
             }
 
@@ -895,7 +942,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             const diffForPrompt = truncated ? cleanDiff.slice(0, maxDiffChars) : cleanDiff;
 
             const context = [
-                'Generate a concise Git commit message for the staged changes.',
+                'Generate a concise Git commit message for the selected changes.',
                 '',
                 'Rules:',
                 '- Return only the commit message. No Markdown, quotes, explanation, or code fences.',
@@ -906,7 +953,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 '',
                 'Recent commit subjects:',
                 String(history).trim() || '(none available)',
-                ...(truncated ? ['', `Note: the staged diff was truncated to ${maxDiffChars} characters.`] : [])
+                ...(truncated ? ['', `Note: the selected diff was truncated to ${maxDiffChars} characters.`] : [])
             ].join('\n');
 
             const command = config.get<string>('ai.command', 'codex').trim() || 'codex';
@@ -981,15 +1028,38 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private async commit(repo: Repository, message: string, push: boolean): Promise<void> {
+    private async diffForFiles(repo: Repository, files: string[]): Promise<{ stdout: string; stderr: string }> {
+        const root = repo.rootUri.fsPath;
+        const relativeFiles = files.map(file => path.relative(root, file));
+        const { stdout } = await execFileAsync(
+            'git',
+            ['diff', 'HEAD', '--no-ext-diff', '--unified=3', '--', ...relativeFiles],
+            { cwd: root, maxBuffer: 4 * 1024 * 1024 }
+        );
+
+        const untracked = this.untrackedPathSet(repo);
+        const untrackedText: string[] = [];
+        for (const file of files.filter(file => untracked.has(path.normalize(file)))) {
+            try {
+                const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+                untrackedText.push(`diff --git a/${path.relative(root, file)} b/${path.relative(root, file)}\nnew file\n${document.getText()}`);
+            } catch {
+                // Ignore unreadable/binary untracked files in the AI prompt.
+            }
+        }
+
+        return { stdout: [String(stdout).trim(), ...untrackedText].filter(Boolean).join('\n\n'), stderr: '' };
+    }
+
+    private async commit(repo: Repository, message: string, push: boolean, files: string[]): Promise<void> {
         const cleanMessage = message.trim();
         if (!cleanMessage) {
             vscode.window.showWarningMessage('Enter a commit message first.');
             return;
         }
 
-        if (repo.state.indexChanges.length === 0) {
-            vscode.window.showWarningMessage('No staged changes. Tick the files you want to commit first.');
+        if (!files.length) {
+            vscode.window.showWarningMessage('Select at least one file to commit.');
             return;
         }
 
@@ -1004,11 +1074,32 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             }
         }
 
+        const pushTarget = push ? await this.resolvePushTarget(repo) : undefined;
+        if (push && !pushTarget) return;
+
+        const selected = new Set(files.map(file => path.normalize(file)));
+        const stagedButNotSelected = repo.state.indexChanges
+            .map(change => change.uri.fsPath)
+            .filter(file => !selected.has(path.normalize(file)));
+
+        // The checkboxes represent AOH selection, not the Git index. Only now, at the
+        // definitive commit action, synchronize the index with that selection.
+        if (stagedButNotSelected.length) {
+            await repo.restore(stagedButNotSelected, { staged: true });
+        }
+        await repo.add(files);
         await repo.commit(cleanMessage, { postCommitCommand: null });
 
-        if (push) {
-            const hasUpstream = !!repo.state.HEAD?.upstream;
-            await repo.push(undefined, undefined, !hasUpstream);
+        if (push && pushTarget) {
+            if (pushTarget.publish) {
+                await execFileAsync(
+                    'git',
+                    ['push', '--set-upstream', pushTarget.remote, pushTarget.branch],
+                    { cwd: repo.rootUri.fsPath }
+                );
+            } else {
+                await repo.push();
+            }
         }
 
         this.view?.webview.postMessage({ type: 'committed', repo: repo.rootUri.fsPath });
@@ -1523,6 +1614,8 @@ let contextTarget = null;
 let state = { repositories: [], aiEnabled: false };
 let activeRepo = '';
 let activeTab = 'changes';
+const selectedFiles = new Map();
+const initializedRepos = new Set();
 
 function debug(message) {
     vscode.postMessage({ type: 'debug', message: String(message) });
@@ -1565,6 +1658,57 @@ function showRollbackMenu(event, repo, files) {
     contextMenu.style.top = Math.max(margin, top) + 'px';
 }
 
+function initializeSelection(repo) {
+    const visible = new Set([...(repo.tracked || []), ...(repo.untracked || [])].map(file => file.file));
+    let selected = selectedFiles.get(repo.root);
+    if (!initializedRepos.has(repo.root)) {
+        selected = new Set((repo.stagedFiles || []).filter(file => visible.has(file)));
+        selectedFiles.set(repo.root, selected);
+        initializedRepos.add(repo.root);
+    } else {
+        for (const file of [...selected]) if (!visible.has(file)) selected.delete(file);
+    }
+}
+
+function selectedForRepo(repoRoot) {
+    return [...(selectedFiles.get(repoRoot) || new Set())];
+}
+
+function isSelected(repoRoot, file) {
+    return selectedFiles.get(repoRoot)?.has(file) || false;
+}
+
+function setSelected(repoRoot, files, checked) {
+    let selected = selectedFiles.get(repoRoot);
+    if (!selected) {
+        selected = new Set();
+        selectedFiles.set(repoRoot, selected);
+    }
+    for (const file of files) checked ? selected.add(file) : selected.delete(file);
+}
+
+function selectionAttrs(repoRoot, files) {
+    const selectedCount = files.filter(file => isSelected(repoRoot, file)).length;
+    return selectedCount === files.length && files.length ? 'checked ' : '';
+}
+
+function syncVisibleChecks(repoRoot) {
+    document.querySelectorAll('.file-check').forEach(input => {
+        if (input.dataset.repo === repoRoot) input.checked = isSelected(repoRoot, input.dataset.file);
+    });
+    updateParentChecks(repoRoot);
+}
+
+function updateParentChecks(repoRoot) {
+    document.querySelectorAll('.group-check, .folder-check').forEach(input => {
+        if (input.dataset.repo !== repoRoot) return;
+        const files = JSON.parse(input.dataset.files || '[]');
+        const selectedCount = files.filter(file => isSelected(repoRoot, file)).length;
+        input.checked = files.length > 0 && selectedCount === files.length;
+        input.indeterminate = selectedCount > 0 && selectedCount < files.length;
+    });
+}
+
 function render() {
     document.documentElement.style.setProperty('--list-item-spacing', (state.listItemSpacing ?? 2) + 'px');
     changesTab.classList.toggle('active', activeTab === 'changes');
@@ -1605,14 +1749,15 @@ function renderChangesRepository(repo) {
     const branchInfo = repo.branch +
         (repo.ahead ? ' ↑' + repo.ahead : '') +
         (repo.behind ? ' ↓' + repo.behind : '');
-    const staged = renderGroup(repo, 'Staged', repo.staged, true);
-    const unstaged = renderGroup(repo, 'Changes', repo.unstaged, false);
+    initializeSelection(repo);
+    const tracked = renderGroup(repo, 'Tracked', repo.tracked);
+    const untracked = renderGroup(repo, 'Untracked', repo.untracked);
 
     return '<section class="repo" data-repo="' + esc(repo.root) + '">' +
         '<div class="repo-header"><span class="repo-title">' + esc(repo.name) + '</span>' +
         '<div class="branch-wrap"><span class="branch" title="Branch actions" data-repo="' + esc(repo.root) + '">' + esc(branchInfo) + ' ▾</span>' +
         renderBranchMenu(repo) + '</div></div>' +
-        staged + unstaged +
+        tracked + untracked +
         '</section>';
 }
 
@@ -1784,7 +1929,8 @@ function bindChangeEvents() {
     document.querySelectorAll('.file-check').forEach(el => {
         el.addEventListener('change', event => {
             const input = event.currentTarget;
-            vscode.postMessage({ type: input.checked ? 'stage' : 'unstage', repo: input.dataset.repo, file: input.dataset.file });
+            setSelected(input.dataset.repo, [input.dataset.file], input.checked);
+            updateParentChecks(input.dataset.repo);
         });
     });
 
@@ -1793,7 +1939,8 @@ function bindChangeEvents() {
         el.addEventListener('change', event => {
             const input = event.currentTarget;
             const files = JSON.parse(input.dataset.files || '[]');
-            vscode.postMessage({ type: input.checked ? 'stageAll' : 'unstageAll', repo: input.dataset.repo, files });
+            setSelected(input.dataset.repo, files, input.checked);
+            syncVisibleChecks(input.dataset.repo);
         });
     });
 
@@ -1878,18 +2025,18 @@ function renderBranchMenu(repo) {
       '</div>';
 }
 
-function renderGroup(repo, title, files, staged) {
+function renderGroup(repo, title, files) {
     if (!files.length) return '';
     const mode = state.viewMode || 'flat';
     const content = mode === 'tree'
-      ? renderTree(repo, files, staged)
-      : files.map(file => renderFileRow(repo, file, staged, false)).join('');
+      ? renderTree(repo, files)
+      : files.map(file => renderFileRow(repo, file, false)).join('');
     const filesJson = esc(JSON.stringify(files.map(file => file.file)));
 
     return '<div class="group">' +
       '<div class="group-title">' +
-      '<input class="group-check" type="checkbox" ' + (staged ? 'checked ' : '') +
-        'title="' + (staged ? 'Unmark all' : 'Mark all') + '"' +
+      '<input class="group-check" type="checkbox" ' + selectionAttrs(repo.root, files.map(file => file.file)) +
+        'title="Select group"' +
         'data-repo="' + esc(repo.root) + '" data-files="' + filesJson + '">' +
       title + '<span class="count">' + files.length + '</span>' +
       '</div>' +
@@ -1935,18 +2082,18 @@ function gitStatusClass(status) {
     }
 }
 
-function renderFileRow(repo, file, staged, treeFile) {
+function renderFileRow(repo, file, treeFile) {
     const statusClass = gitStatusClass(file.status);
     return '<div class="file-row' + (treeFile ? ' tree-file' : '') + (statusClass ? ' ' + statusClass : '') + '" title="' + esc(file.tooltip) + '">' +
-      '<input class="file-check" type="checkbox" ' + (staged ? 'checked ' : '') +
+      '<input class="file-check" type="checkbox" ' + (isSelected(repo.root, file.file) ? 'checked ' : '') +
         'data-repo="' + esc(repo.root) + '" data-file="' + esc(file.file) + '">' +
-      '<div class="file-main" data-repo="' + esc(repo.root) + '" data-file="' + esc(file.file) + '" data-staged="' + (staged ? 'true' : 'false') + '" data-status="' + file.status + '">' +
+      '<div class="file-main" data-repo="' + esc(repo.root) + '" data-file="' + esc(file.file) + '" data-staged="' + (file.stagedOnly ? 'true' : 'false') + '" data-status="' + file.status + '">' +
         '<span class="file-name">' + esc(file.name) + '</span>' +
         (!treeFile && file.dir ? '<span class="file-dir">' + esc(file.dir) + '</span>' : '') +
       '</div></div>';
 }
 
-function renderTree(repo, files, staged) {
+function renderTree(repo, files) {
     const root = { dirs: new Map(), files: [] };
 
     for (const file of files) {
@@ -1975,8 +2122,8 @@ function renderTree(repo, files, staged) {
             const filesJson = esc(JSON.stringify(descendantFiles(child)));
             return '<details class="tree-folder" open>' +
               '<summary>' +
-                '<input class="folder-check" type="checkbox" ' + (staged ? 'checked ' : '') +
-                  'title="' + (staged ? 'Unmark folder' : 'Mark folder') + '"' +
+                '<input class="folder-check" type="checkbox" ' + selectionAttrs(repo.root, descendantFiles(child)) +
+                  'title="Select folder"' +
                   'data-repo="' + esc(repo.root) + '" data-files="' + filesJson + '">' +
                 '<span>' + esc(name) + '</span>' +
               '</summary>' +
@@ -1987,7 +2134,7 @@ function renderTree(repo, files, staged) {
         const rows = node.files
           .slice()
           .sort((a, b) => a.name.localeCompare(b.name))
-          .map(file => renderFileRow(repo, file, staged, true))
+          .map(file => renderFileRow(repo, file, true))
           .join('');
 
         return dirs + rows;
@@ -2002,7 +2149,8 @@ function doCommit(push) {
     vscode.postMessage({
         type: push ? 'commitPush' : 'commit',
         repo: repo.root,
-        message: message.value
+        message: message.value,
+        files: selectedForRepo(repo.root)
     });
 }
 
@@ -2012,7 +2160,8 @@ generateCommitMessage.addEventListener('click', () => {
 
     vscode.postMessage({
         type: 'generateCommitMessage',
-        repo: repo.root
+        repo: repo.root,
+        files: selectedForRepo(repo.root)
     });
 });
 

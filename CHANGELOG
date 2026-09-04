@@ -1,6 +1,21 @@
+## 2.3.1
+
+- Fix Tracked / Untracked grouping by classifying untracked files by Git status instead of relying on VS Code's optional untrackedChanges collection.
+- Remove the Stage button; checkboxes are selection only and do not mutate the Git index.
+- Commit and Commit & Push stage only the selected files at commit time.
+- Prompt before publishing a local branch that has no upstream; confirmed publication uses git push --set-upstream.
+
 # Changelog
 
 All notable changes to AOH Git will be documented in this file.
+
+## 2.3.0
+
+- Changed the Changes view to group files as Tracked and Untracked.
+- Checkboxes now represent the AOH action selection and no longer stage/unstage immediately.
+- Added Stage action for staging only the currently selected files.
+- Commit and Commit & Push now synchronize the Git index with the selected files only when the commit is executed.
+- AI commit-message generation now uses the selected files instead of requiring pre-staged changes.
 
 ## 2.2.0
 
