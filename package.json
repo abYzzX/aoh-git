@@ -2,7 +2,7 @@
   "name": "aoh-git",
   "displayName": "AOH - Git",
   "description": "AOH - Rider-inspired Git workflow for VS Code.",
-  "version": "2.3.1",
+  "version": "2.4.1",
   "publisher": "Abyzz",
   "icon": "media/aoh-logo-icon.png",
   "license": "MIT",
@@ -56,12 +56,17 @@
       {
         "command": "aoh.git.fetch",
         "title": "Fetch",
-        "icon": "$(cloud-download)"
+        "icon": "media/fetch.svg"
       },
       {
         "command": "aoh.git.pull",
         "title": "Pull",
-        "icon": "$(repo-pull)"
+        "icon": "media/pull.svg"
+      },
+      {
+        "command": "aoh.git.push",
+        "title": "Push",
+        "icon": "media/push.svg"
       }
     ],
     "menus": {
@@ -82,9 +87,14 @@
           "group": "navigation@3"
         },
         {
-          "command": "aoh.git.toggleViewMode",
+          "command": "aoh.git.push",
           "when": "view == aoh.git.view",
           "group": "navigation@4"
+        },
+        {
+          "command": "aoh.git.toggleViewMode",
+          "when": "view == aoh.git.view",
+          "group": "navigation@5"
         }
       ]
     },

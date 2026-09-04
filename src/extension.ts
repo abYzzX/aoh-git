@@ -114,6 +114,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('aoh.git.toggleViewMode', () => provider.toggleViewMode()),
         vscode.commands.registerCommand('aoh.git.fetch', () => provider.runRepositoryAction('fetch')),
         vscode.commands.registerCommand('aoh.git.pull', () => provider.runRepositoryAction('pull')),
+        vscode.commands.registerCommand('aoh.git.push', () => provider.runRepositoryAction('push')),
         vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration('aoh.git')) provider.refresh();
         })
@@ -692,7 +693,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    async runRepositoryAction(action: 'fetch' | 'pull'): Promise<void> {
+    async runRepositoryAction(action: 'fetch' | 'pull' | 'push'): Promise<void> {
         const repositories = this.api?.repositories ?? [];
         if (!repositories.length) {
             vscode.window.showWarningMessage('AOH - Git: no Git repository found.');
@@ -707,7 +708,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                     description: candidate.rootUri.fsPath,
                     repo: candidate
                 })),
-                { placeHolder: `${action === 'fetch' ? 'Fetch' : 'Pull'} repository` }
+                { placeHolder: `${action === 'fetch' ? 'Fetch' : action === 'pull' ? 'Pull' : 'Push'} repository` }
             );
             if (!picked) return;
             repo = picked.repo;
