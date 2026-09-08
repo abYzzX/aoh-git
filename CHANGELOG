@@ -1,3 +1,15 @@
+2.4.4
+- Use the active VS Code file icon theme for changed files and folders in the Changes webview.
+- Resolve icon-theme file/folder mappings (including expanded folders), SVG/PNG resources and icon-font glyphs from the contributing extension.
+- Reload icons automatically when the configured file icon theme or active color theme changes.
+
+2.4.3
+- Fix tree file indentation and render real file/folder icons in the Changes webview.
+
+2.4.2
+- Fixed file indentation in tree view so file rows align with sibling folder contents.
+- Added compact file-type icons for common source/config file extensions in Changes tree and flat views.
+
 ## 2.3.1
 
 - Fix Tracked / Untracked grouping by classifying untracked files by Git status instead of relying on VS Code's optional untrackedChanges collection.

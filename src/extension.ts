@@ -3,6 +3,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
+import { FileIconThemeService } from './fileIconThemeService';
 
 const execFileAsync = promisify(execFile);
 
@@ -116,8 +117,13 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('aoh.git.pull', () => provider.runRepositoryAction('pull')),
         vscode.commands.registerCommand('aoh.git.push', () => provider.runRepositoryAction('push')),
         vscode.workspace.onDidChangeConfiguration(e => {
-            if (e.affectsConfiguration('aoh.git')) provider.refresh();
-        })
+            if (e.affectsConfiguration('workbench.iconTheme')) {
+                provider.reloadFileIconTheme();
+            } else if (e.affectsConfiguration('aoh.git')) {
+                provider.refresh();
+            }
+        }),
+        vscode.window.onDidChangeActiveColorTheme(() => provider.reloadFileIconTheme())
     );
 }
 
@@ -125,18 +131,22 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
     private view?: vscode.WebviewView;
     private api?: GitAPI;
     private repoSubscriptions: vscode.Disposable[] = [];
+    private readonly fileIconTheme: FileIconThemeService;
 
     constructor(
         private readonly context: vscode.ExtensionContext,
         private readonly extensionUri: vscode.Uri,
         private readonly gitExtension: vscode.Extension<GitExtension>,
         private readonly output: vscode.OutputChannel
-    ) {}
+    ) {
+        this.fileIconTheme = new FileIconThemeService(output);
+    }
 
     async resolveWebviewView(view: vscode.WebviewView): Promise<void> {
         this.output.appendLine('[webview] Resolving AOH Git view.');
         this.view = view;
-        view.webview.options = { enableScripts: true };
+        await this.fileIconTheme.load(view.webview);
+        this.applyWebviewOptions();
         view.webview.html = this.html(view.webview);
 
         view.webview.onDidReceiveMessage((message: WebMessage) => this.handle(message));
@@ -156,6 +166,23 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 this.refresh();
             });
         });
+    }
+
+    async reloadFileIconTheme(): Promise<void> {
+        if (!this.view) return;
+        await this.fileIconTheme.load(this.view.webview);
+        this.applyWebviewOptions();
+        await this.refresh();
+    }
+
+    private applyWebviewOptions(): void {
+        if (!this.view) return;
+        const roots = [this.extensionUri];
+        if (this.fileIconTheme.resourceRoot) roots.push(this.fileIconTheme.resourceRoot);
+        this.view.webview.options = {
+            enableScripts: true,
+            localResourceRoots: roots
+        };
     }
 
     private async ensureGit(): Promise<void> {
@@ -292,18 +319,34 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 ahead: repo.state.HEAD?.ahead ?? 0,
                 behind: repo.state.HEAD?.behind ?? 0,
                 hasUpstream: !!repo.state.HEAD?.upstream,
-                tracked: tracked.map(c => ({ ...this.serializeChange(root, c), stagedOnly: stagedPathSet.has(path.normalize(c.uri.fsPath)) && !workingPathSet.has(path.normalize(c.uri.fsPath)) })),
-                untracked: untracked.map(c => ({ ...this.serializeChange(root, c), stagedOnly: false })),
+                tracked: tracked.map(c => ({ ...this.serializeChange(root, c, this.view!.webview), stagedOnly: stagedPathSet.has(path.normalize(c.uri.fsPath)) && !workingPathSet.has(path.normalize(c.uri.fsPath)) })),
+                untracked: untracked.map(c => ({ ...this.serializeChange(root, c, this.view!.webview), stagedOnly: false })),
                 stagedFiles,
-                stashes: await this.readStashes(root)
+                stashes: await this.readStashes(root, this.view!.webview)
             };
         }));
+
+            const folderNames = new Set<string>();
+            for (const repoState of repositoryStates) {
+                for (const file of [...repoState.tracked, ...repoState.untracked]) {
+                    for (const part of file.dirParts) folderNames.add(part);
+                }
+            }
+
+            const folderIcons = Object.fromEntries(
+                [...folderNames].map(name => [name.toLowerCase(), this.fileIconTheme.resolveFolder(this.view!.webview, name)])
+            );
 
             const posted = await this.view.webview.postMessage({
                 type: 'state',
                 listItemSpacing,
                 viewMode,
                 aiEnabled,
+                fileIconTheme: {
+                    css: this.fileIconTheme.css,
+                    defaultFolder: this.fileIconTheme.resolveFolder(this.view.webview, ''),
+                    folders: folderIcons
+                },
                 repositories: repositoryStates
             });
             this.output.appendLine(`[refresh] State posted=${posted}; repositories=${repositoryStates.length}; viewMode=${viewMode}`);
@@ -332,7 +375,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         });
     }
 
-    private serializeChange(root: string, change: Change) {
+    private serializeChange(root: string, change: Change, webview: vscode.Webview) {
         const rel = path.relative(root, change.uri.fsPath);
         const directory = path.dirname(rel) === '.' ? '' : path.dirname(rel);
         return {
@@ -341,11 +384,12 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             dir: directory,
             dirParts: directory ? directory.split(path.sep).filter(Boolean) : [],
             tooltip: this.statusLabel(change.status),
-            status: change.status
+            status: change.status,
+            icon: this.fileIconTheme.resolveFile(webview, change.uri.fsPath)
         };
     }
 
-    private async readStashes(root: string) {
+    private async readStashes(root: string, webview: vscode.Webview) {
         try {
             const { stdout } = await execFileAsync(
                 'git',
@@ -387,7 +431,8 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                         name: path.basename(relativePath),
                         dir: path.dirname(relativePath) === '.' ? '' : path.dirname(relativePath),
                         status,
-                        untracked: untracked.has(relativePath)
+                        untracked: untracked.has(relativePath),
+                        icon: this.fileIconTheme.resolveFile(webview, path.join(root, relativePath))
                     };
                 });
 
@@ -1112,7 +1157,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; font-src ${webview.cspSource}; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
 :root { --list-item-spacing: 2px; }
@@ -1482,7 +1527,23 @@ body {
 .tree-folder:not([open]) > summary::before { content: "▸"; }
 .tree-folder > summary:hover { background: var(--vscode-list-hoverBackground); }
 .tree-children { padding-left: 14px; }
+.tree-file { padding-left: 24px; }
 .tree-file .file-main { gap: 6px; }
+.node-icon {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    overflow: visible;
+}
+.node-icon img { width: 16px; height: 16px; display: block; object-fit: contain; }
+.node-icon-font { line-height: 16px; text-align: center; }
+.folder-icon-open { display: inline-flex; }
+.folder-icon-closed { display: none; }
+.tree-folder:not([open]) > summary .folder-icon-open { display: none; }
+.tree-folder:not([open]) > summary .folder-icon-closed { display: inline-flex; }
 .view-mode-label {
     margin-left: auto;
     color: var(--vscode-descriptionForeground);
@@ -1572,6 +1633,7 @@ button.secondary:hover { background: var(--vscode-button-secondaryHoverBackgroun
 button:disabled { opacity: .55; cursor: default; }
 
 </style>
+<style id="file-icon-theme-fonts"></style>
 </head>
 <body>
 <div id="app">
@@ -2083,11 +2145,41 @@ function gitStatusClass(status) {
     }
 }
 
+function themeIconHtml(icon, extraClass) {
+    if (!icon) return '';
+    const classes = 'node-icon' + (extraClass ? ' ' + extraClass : '');
+    if (icon.kind === 'image') {
+        return '<span class="' + classes + '" aria-hidden="true"><img src="' + esc(icon.uri) + '"></span>';
+    }
+    if (icon.kind === 'font') {
+        const style = [
+            'font-family:' + JSON.stringify(icon.fontFamily),
+            icon.color ? 'color:' + icon.color : '',
+            icon.fontSize ? 'font-size:' + icon.fontSize : ''
+        ].filter(Boolean).join(';');
+        return '<span class="' + classes + ' node-icon-font" aria-hidden="true" style="' + esc(style) + '">' + esc(icon.character) + '</span>';
+    }
+    return '';
+}
+
+function fileThemeIcon(file) {
+    return themeIconHtml(file.icon, 'file-theme-icon');
+}
+
+function folderThemeIcons(name) {
+    const theme = state.fileIconTheme || {};
+    const pair = (theme.folders && theme.folders[String(name || '').toLowerCase()]) || theme.defaultFolder || {};
+    const open = themeIconHtml(pair.open || pair.closed, 'folder-icon-open');
+    const closed = themeIconHtml(pair.closed || pair.open, 'folder-icon-closed');
+    return open + closed;
+}
+
 function renderFileRow(repo, file, treeFile) {
     const statusClass = gitStatusClass(file.status);
     return '<div class="file-row' + (treeFile ? ' tree-file' : '') + (statusClass ? ' ' + statusClass : '') + '" title="' + esc(file.tooltip) + '">' +
       '<input class="file-check" type="checkbox" ' + (isSelected(repo.root, file.file) ? 'checked ' : '') +
         'data-repo="' + esc(repo.root) + '" data-file="' + esc(file.file) + '">' +
+      fileThemeIcon(file) +
       '<div class="file-main" data-repo="' + esc(repo.root) + '" data-file="' + esc(file.file) + '" data-staged="' + (file.stagedOnly ? 'true' : 'false') + '" data-status="' + file.status + '">' +
         '<span class="file-name">' + esc(file.name) + '</span>' +
         (!treeFile && file.dir ? '<span class="file-dir">' + esc(file.dir) + '</span>' : '') +
@@ -2126,6 +2218,7 @@ function renderTree(repo, files) {
                 '<input class="folder-check" type="checkbox" ' + selectionAttrs(repo.root, descendantFiles(child)) +
                   'title="Select folder"' +
                   'data-repo="' + esc(repo.root) + '" data-files="' + filesJson + '">' +
+                folderThemeIcons(name) +
                 '<span>' + esc(name) + '</span>' +
               '</summary>' +
               '<div class="tree-children">' + nodeHtml(child) + '</div>' +
@@ -2201,6 +2294,8 @@ window.addEventListener('message', event => {
     if (data.type === 'state') {
         debug('State received. repositories=' + (data.repositories?.length ?? 0) + ', viewMode=' + data.viewMode);
         state = data;
+        const iconFontStyle = document.getElementById('file-icon-theme-fonts');
+        if (iconFontStyle) iconFontStyle.textContent = state.fileIconTheme?.css || '';
         if (!activeRepo && state.repositories.length) activeRepo = state.repositories[0].root;
         render();
     } else if (data.type === 'fatalError') {
