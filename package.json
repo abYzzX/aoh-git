@@ -6,9 +6,17 @@
   "publisher": "Abyzz",
   "icon": "media/aoh-git-icon.png",
   "license": "MIT",
+    "repository": {
+    "type": "git",
+    "url": "https://github.com/Abyzz/aoh-git.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Abyzz/aoh-git/issues"
+  },
+  "homepage": "https://github.com/Abyzz/aoh-git#readme",
   "engines": {
     "vscode": "^1.96.0"
-  },
+  },  
   "categories": [
     "Other"
   ],
