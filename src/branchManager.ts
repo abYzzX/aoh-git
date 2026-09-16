@@ -3,6 +3,7 @@ import * as path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { GitAPI, Repository } from './gitApi';
+import { parseLocalBranches, parseRemoteBranches, splitRemoteBranch } from './gitOutput';
 
 const execFileAsync = promisify(execFile);
 
@@ -44,7 +45,7 @@ async function selectBranchForRepo(repo: Repository): Promise<void> {
         { label: '$(add) Create new branch…', branchKind: 'create' }
     ];
 
-    for (const branch of local.split(/\r?\n/).map(v => v.trim()).filter(Boolean).sort()) {
+    for (const branch of parseLocalBranches(local)) {
         items.push({
             label: branch === current ? `$(check) ${branch}` : `$(git-branch) ${branch}`,
             description: branch === current ? 'current branch' : 'local',
@@ -53,9 +54,7 @@ async function selectBranchForRepo(repo: Repository): Promise<void> {
         });
     }
 
-    for (const line of remote.split(/\r?\n/).map(v => v.trim()).filter(Boolean).sort()) {
-        const [name, symref] = line.split('|', 2);
-        if (symref || name.endsWith('/HEAD')) continue;
+    for (const name of parseRemoteBranches(remote)) {
         items.push({ label: `$(cloud) ${name}`, description: 'remote', branchKind: 'remote', value: name });
     }
 
@@ -71,8 +70,7 @@ async function selectBranchForRepo(repo: Repository): Promise<void> {
         if (branch !== current) await execFileAsync('git', ['switch', branch], { cwd });
     } else {
         const remoteBranch = picked.value!;
-        const slash = remoteBranch.indexOf('/');
-        const branchName = slash >= 0 ? remoteBranch.slice(slash + 1) : remoteBranch;
+        const branchName = splitRemoteBranch(remoteBranch).branch;
         try {
             await execFileAsync('git', ['switch', branchName], { cwd });
         } catch {

@@ -1,12 +1,24 @@
-2.4.4
+# Changelog
+
+All notable changes to AOH - Git will be documented in this file.
+
+## Unreleased
+
+### Changed
+
+- Standardized the repository documentation structure around shared AOH rules and extension-specific design/agent documentation.
+- Added automated tests for deterministic Git branch-output parsing.
+- Repository-local Gitea Actions and GitVersion configuration are intentionally not part of this repository.
+
+## 2.4.4
 - Use the active VS Code file icon theme for changed files and folders in the Changes webview.
 - Resolve icon-theme file/folder mappings (including expanded folders), SVG/PNG resources and icon-font glyphs from the contributing extension.
 - Reload icons automatically when the configured file icon theme or active color theme changes.
 
-2.4.3
+## 2.4.3
 - Fix tree file indentation and render real file/folder icons in the Changes webview.
 
-2.4.2
+## 2.4.2
 - Fixed file indentation in tree view so file rows align with sibling folder contents.
 - Added compact file-type icons for common source/config file extensions in Changes tree and flat views.
 
@@ -16,10 +28,6 @@
 - Remove the Stage button; checkboxes are selection only and do not mutate the Git index.
 - Commit and Commit & Push stage only the selected files at commit time.
 - Prompt before publishing a local branch that has no upstream; confirmed publication uses git push --set-upstream.
-
-# Changelog
-
-All notable changes to AOH Git will be documented in this file.
 
 ## 2.3.0
 

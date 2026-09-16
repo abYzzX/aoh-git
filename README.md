@@ -76,3 +76,28 @@ AOH - Git writes diagnostic information to the `AOH - Git` output channel. This 
 - The built-in VS Code Git extension
 
 An external AI CLI is required only when AI commit-message generation is enabled.
+
+
+## Development
+
+Install dependencies and run the complete local validation:
+
+```bash
+npm test
+```
+
+This compiles the TypeScript sources and runs the automated Node tests.
+
+Project documentation:
+
+- [AOH repository rules](AOH-RULES.md)
+- [Extension design](EXTENSION-DESIGN.md)
+- [Agent instructions](AGENT.md)
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
+
+The repository intentionally does not contain a Gitea Actions pipeline or GitVersion configuration. Build and release orchestration is external to the extension repository.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
