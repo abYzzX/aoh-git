@@ -2,7 +2,7 @@
   "name": "aoh-git",
   "displayName": "AOH - Git",
   "description": "AOH - Rider-inspired Git workflow for VS Code.",
-  "version": "2.4.5",
+  "version": "0.0.0",
   "publisher": "Abyzz",
   "icon": "media/aoh-git-icon.png",
   "license": "MIT",
