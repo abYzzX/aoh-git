@@ -1,3 +1,4 @@
+import { diagnosticText } from './logging';
 import * as vscode from 'vscode';
 import * as path from 'path';
 
@@ -63,7 +64,7 @@ export class FileIconThemeService {
     private fontFamilies = new Map<string, string>();
     private fontCss = '';
 
-    constructor(private readonly output: vscode.OutputChannel) {}
+    constructor(private readonly output: vscode.LogOutputChannel) {}
 
     get resourceRoot(): vscode.Uri | undefined {
         return this.themeExtensionUri;
@@ -82,13 +83,13 @@ export class FileIconThemeService {
 
         const themeId = vscode.workspace.getConfiguration('workbench').get<string>('iconTheme');
         if (!themeId) {
-            this.output.appendLine('[icons] No active workbench icon theme configured.');
+            this.output.debug('[icons] No active workbench icon theme configured.');
             return;
         }
 
         const match = this.findThemeContribution(themeId);
         if (!match) {
-            this.output.appendLine(`[icons] Could not resolve active icon theme: ${themeId}`);
+            this.output.warn(`[icons] Could not resolve active icon theme: ${themeId}`);
             return;
         }
 
@@ -103,12 +104,12 @@ export class FileIconThemeService {
             this.themeExtensionUri = match.extension.extensionUri;
             this.buildFontCss(webview);
 
-            this.output.appendLine(
+            this.output.debug(
                 `[icons] Using file icon theme ${themeId} from ${match.extension.id}.`
             );
         } catch (err) {
-            const text = err instanceof Error ? err.message : String(err);
-            this.output.appendLine(`[icons] Failed to load ${themeId}: ${text}`);
+            const text = diagnosticText(err);
+            this.output.warn(`[icons] Failed to load ${themeId}: ${text}`);
         }
     }
 

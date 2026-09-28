@@ -125,3 +125,9 @@ The repository intentionally does not contain a Gitea Actions pipeline or GitVer
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Push always targets the same branch name on the selected remote. Missing or differently named upstreams require confirmation before publication (and before staging/committing in Commit & Push). Cancelling leaves the index and commits unchanged. Creating a branch does not inherit tracking from its starting point. Push alone never commits; if a push fails after Commit & Push, the local commit remains and can be uploaded with Push.
+
+Diagnostics are available in Output → AOH - Git, with timestamped warnings and errors including Git failure details. Routine refresh messages are omitted; additional lifecycle diagnostics use the Debug log level.
+
+Use the clock button in the commit message box, beside the AI button, to select one of the latest 100 commit messages. Selection copies the full message into the editor; cancelling leaves the draft unchanged. The history button is also available when AI is disabled.

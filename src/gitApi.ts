@@ -33,6 +33,7 @@ export interface Repository {
     add(paths: string[]): Promise<void>;
     restore(paths: string[], options?: { staged?: boolean; ref?: string }): Promise<void>;
     commit(message: string, opts?: { all?: boolean | 'tracked'; postCommitCommand?: string | null }): Promise<void>;
+    log(options?: { maxEntries?: number }): Promise<Array<{ hash: string; message: string }>>;
     push(remoteName?: string, branchName?: string, setUpstream?: boolean): Promise<void>;
     log(options?: { maxEntries?: number; path?: string }): Promise<Array<{ hash: string; message: string }>>;
     merge(ref: string): Promise<void>;

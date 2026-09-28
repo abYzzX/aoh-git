@@ -2,6 +2,13 @@
 
 All notable changes to AOH - Git will be documented in this file.
 
+## 0.1.4
+
+- Restore the clock-icon button beside AI in the commit message box to reuse complete recent commit messages.
+- Fix pushing branches with an inherited, differently named upstream; confirm publication before Commit & Push changes the index or creates a commit.
+- Create branches without inheriting upstream tracking and push explicitly to the matching remote branch.
+- Add timestamped warning/error diagnostics, remove refresh log noise, and clearly report local commits retained after failed pushes.
+
 ## 0.1.3
 
 - Reuse a complete previous commit message through a compact clock-icon button inside the commit message box, next to the AI button.

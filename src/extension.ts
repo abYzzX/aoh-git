@@ -13,6 +13,8 @@ import { relativePaths } from './contextGit';
 import { RefreshQueue } from './refreshQueue';
 import { StashStore } from './stashStore';
 import { runAi } from './ai';
+import { needsPublication, pushArguments } from './push';
+import { diagnosticText } from './logging';
 import { commitSelection } from './commit';
 import { selectedDiff, maxDiffChars } from './selectedDiff';
 
@@ -39,13 +41,13 @@ type WebMessage =
     | { type: 'debug'; message: string };
 
 export function activate(context: vscode.ExtensionContext) {
-    const output = vscode.window.createOutputChannel('AOH - Git');
+    const output = vscode.window.createOutputChannel('AOH - Git', { log: true });
     context.subscriptions.push(output);
-    output.appendLine('[activate] AOH - Git starting.');
+    output.debug('[activate] AOH - Git starting.');
 
     const gitExtension = vscode.extensions.getExtension<GitExtension>('vscode.git');
     if (!gitExtension) {
-        output.appendLine('[activate] ERROR: built-in Git extension was not found.');
+        output.error('[activate] built-in Git extension was not found.');
         output.show(true);
         vscode.window.showErrorMessage('AOH - Git: built-in Git extension was not found.');
         return;
@@ -99,13 +101,13 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         private readonly context: vscode.ExtensionContext,
         private readonly extensionUri: vscode.Uri,
         private readonly gitExtension: vscode.Extension<GitExtension>,
-        private readonly output: vscode.OutputChannel
+        private readonly output: vscode.LogOutputChannel
     ) {
         this.fileIconTheme = new FileIconThemeService(output);
     }
 
     async resolveWebviewView(view: vscode.WebviewView): Promise<void> {
-        this.output.appendLine('[webview] Resolving AOH Git view.');
+        this.output.debug('[webview] Resolving AOH Git view.');
         this.view = view;
         this.lastState = '';
         await this.fileIconTheme.load(view.webview);
@@ -153,9 +155,9 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
     }
 
     private async ensureGit(): Promise<void> {
-        this.output.appendLine(`[git] Extension active=${this.gitExtension.isActive}`);
+        this.output.debug(`[git] Extension active=${this.gitExtension.isActive}`);
         if (!this.gitExtension.isActive) {
-            this.output.appendLine('[git] Activating built-in Git extension.');
+            this.output.debug('[git] Activating built-in Git extension.');
             await this.gitExtension.activate();
         }
         if (!this.enablementSubscription) {
@@ -170,10 +172,10 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         if (this.gitExtension.exports.enabled) {
             const api = this.gitExtension.exports.getAPI(1);
             this.api = api;
-            this.output.appendLine(`[git] API ready. repositories=${api.repositories.length}`);
+            this.output.debug(`[git] API ready. repositories=${api.repositories.length}`);
         } else {
             this.api = undefined;
-            this.output.appendLine('[git] Built-in Git extension is disabled.');
+            this.output.warn('[git] Built-in Git extension is disabled.');
         }
     }
 
@@ -206,14 +208,12 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
 
     private async refreshState(): Promise<void> {
         if (!this.view) {
-            this.output.appendLine('[refresh] Skipped: webview not resolved yet.');
             return;
         }
 
         try {
             const repositories = this.api?.repositories ?? [];
             this.stashStore.retain(new Set(repositories.map(repo => repo.rootUri.fsPath)));
-            this.output.appendLine(`[refresh] Start. repositories=${repositories.length}`);
             const listItemSpacing = vscode.workspace.getConfiguration('aoh.git').get<number>('listItemSpacing', 2);
             const viewMode = this.context.workspaceState.get<'flat' | 'tree'>('aoh.git.viewMode', 'flat');
             const aiEnabled = vscode.workspace.getConfiguration('aoh.git').get<boolean>('ai.enabled', false);
@@ -275,7 +275,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                         branches: (remoteMap.get(name) ?? []).sort((a, b) => a.localeCompare(b))
                     }));
                 } catch (err) {
-                    this.output.appendLine(`[refresh] Branch enumeration failed for ${root}: ${this.errorText(err)}`);
+                    this.output.warn(`[refresh] Branch enumeration failed for ${root}: ${this.errorText(err)}`);
                     // Keep the view usable even if branch enumeration fails temporarily.
                 }
 
@@ -292,7 +292,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                     untracked: untracked.map(c => ({ ...this.serializeChange(root, c, this.view!.webview), stagedOnly: false })),
                     stagedFiles,
                     stashes: await this.stashStore.list(root).catch(error => {
-                        this.output.appendLine(`[stash] Failed to list stashes: ${this.errorText(error)}`);
+                        this.output.warn(`[stash] Failed to list stashes: ${this.errorText(error)}`);
                         return [];
                     })
                 };
@@ -326,7 +326,6 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
             if (serialized === this.lastState) return;
             const posted = await this.view.webview.postMessage(state);
             if (posted) this.lastState = serialized;
-            this.output.appendLine(`[refresh] State posted=${posted}; repositories=${repositoryStates.length}; viewMode=${viewMode}`);
         } catch (err) {
             this.lastState = '';
             this.logError('refresh', err);
@@ -335,11 +334,18 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
     }
 
     private errorText(err: unknown): string {
-        return err instanceof Error ? `${err.message}${err.stack ? `\n${err.stack}` : ''}` : String(err);
+        return diagnosticText(err);
+    }
+
+    private showWarning<T extends string>(message: string, ...items: T[]): Thenable<T | undefined>;
+    private showWarning<T extends string>(message: string, options: vscode.MessageOptions, ...items: T[]): Thenable<T | undefined>;
+    private showWarning(message: string, ...args: any[]): Thenable<any> {
+        this.output.warn(diagnosticText(message));
+        return vscode.window.showWarningMessage(message, ...args);
     }
 
     private logError(area: string, err: unknown): void {
-        this.output.appendLine(`[${area}] ERROR: ${this.errorText(err)}`);
+        this.output.error(`[${area}] ${this.errorText(err)}`);
         this.output.show(true);
     }
 
@@ -400,13 +406,12 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
 
     private async handle(message: WebMessage): Promise<void> {
         if (message.type === 'debug') {
-            this.output.appendLine(`[webview] ${message.message}`);
+            this.output.debug(`[webview] ${diagnosticText(message.message)}`);
             return;
         }
 
         if (message.type === 'ready' || message.type === 'refresh') {
             if (message.type === 'ready') this.lastState = '';
-            this.output.appendLine(`[webview] ${message.type}`);
             this.refresh();
             return;
         }
@@ -524,7 +529,8 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
             await repo.status();
             this.refresh();
         } catch (err) {
-            const text = err instanceof Error ? err.message : String(err);
+            this.logError(`webview ${message.type} repo=${repo.rootUri.fsPath}`, err);
+            const text = this.errorText(err);
             vscode.window.showErrorMessage(`AOH - Git: ${text}`);
         }
     }
@@ -608,13 +614,13 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         if (includeUntracked) args.push('--include-untracked');
         if (message.trim()) args.push('-m', message.trim());
 
-        this.output.appendLine(`[stash] Creating stash in ${repo.rootUri.fsPath}; includeUntracked=${includeUntracked}`);
+        this.output.debug(`[stash] Creating stash in ${repo.rootUri.fsPath}; includeUntracked=${includeUntracked}`);
         await execFileAsync('git', args, { cwd: repo.rootUri.fsPath, maxBuffer: 10 * 1024 * 1024 });
     }
 
     private async handleStashAction(repo: Repository, action: 'apply' | 'pop' | 'drop', ref: string): Promise<void> {
         if (action === 'drop') {
-            const confirmed = await vscode.window.showWarningMessage(
+            const confirmed = await this.showWarning(
                 `Drop ${ref}? This permanently deletes the stash.`,
                 { modal: true },
                 'Drop Stash'
@@ -622,7 +628,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
             if (confirmed !== 'Drop Stash') return;
         }
 
-        this.output.appendLine(`[stash] ${action} ${ref} in ${repo.rootUri.fsPath}`);
+        this.output.debug(`[stash] ${action} ${ref} in ${repo.rootUri.fsPath}`);
         try {
             await execFileAsync('git', ['stash', action, ref], { cwd: repo.rootUri.fsPath, maxBuffer: 10 * 1024 * 1024 });
         } finally {
@@ -653,13 +659,13 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         const label = uniqueFiles.length === 1
             ? path.basename(uniqueFiles[0])
             : `${uniqueFiles.length} files`;
-        const confirmed = await vscode.window.showWarningMessage(
+        const confirmed = await this.showWarning(
             `Rollback ${label}? All local changes in the selection will be permanently discarded.`,
             { modal: true },
             'Rollback'
         );
         if (confirmed !== 'Rollback') {
-            this.output.appendLine(`[rollback] Cancelled: ${label}`);
+            this.output.debug(`[rollback] Cancelled: ${label}`);
             return;
         }
 
@@ -668,7 +674,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         const untrackedFiles = uniqueFiles.filter(file => untracked.has(path.normalize(file)));
         const trackedFiles = uniqueFiles.filter(file => !untracked.has(path.normalize(file)));
 
-        this.output.appendLine(`[rollback] repo=${root}; selected=${uniqueFiles.length}; tracked=${trackedFiles.length}; untracked=${untrackedFiles.length}`);
+        this.output.debug(`[rollback] repo=${root}; selected=${uniqueFiles.length}; tracked=${trackedFiles.length}; untracked=${untrackedFiles.length}`);
 
         if (trackedFiles.length) {
             const relativePaths = trackedFiles.map(file => path.relative(root, file));
@@ -680,11 +686,11 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         }
 
         for (const file of untrackedFiles) {
-            this.output.appendLine(`[rollback] Removing untracked file: ${file}`);
+            this.output.debug(`[rollback] Removing untracked file: ${file}`);
             await vscode.workspace.fs.delete(vscode.Uri.file(file), { recursive: true, useTrash: false });
         }
 
-        this.output.appendLine(`[rollback] Completed: ${label}`);
+        this.output.debug(`[rollback] Completed: ${label}`);
     }
 
     async toggleViewMode(): Promise<void> {
@@ -696,7 +702,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
     async selectBranch(repoRoot?: string): Promise<void> {
         const repositories = this.api?.repositories ?? [];
         if (!repositories.length) {
-            vscode.window.showWarningMessage('AOH - Git: no Git repository found.');
+            this.showWarning('AOH - Git: no Git repository found.');
             return;
         }
 
@@ -755,7 +761,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                 });
                 if (!name?.trim()) return;
 
-                await execFileAsync('git', ['switch', '-c', name.trim()], { cwd: targetRepo.rootUri.fsPath });
+                await execFileAsync('git', ['switch', '--no-track', '-c', name.trim()], { cwd: targetRepo.rootUri.fsPath });
             } else if (picked.remote) {
                 const { remote, branch } = splitRemoteBranch(picked.branch);
                 await this.handleBranchAction(targetRepo.rootUri.fsPath, 'checkoutRemote', undefined, remote, branch);
@@ -769,7 +775,8 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
             await targetRepo.status();
             this.refresh();
         } catch (err) {
-            const text = err instanceof Error ? err.message : String(err);
+            this.logError('operation', err);
+            const text = this.errorText(err);
             vscode.window.showErrorMessage(`AOH - Git: ${text}`);
         }
     }
@@ -777,7 +784,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
     async runRepositoryAction(action: 'fetch' | 'pull' | 'push'): Promise<void> {
         const repositories = this.api?.repositories ?? [];
         if (!repositories.length) {
-            vscode.window.showWarningMessage('AOH - Git: no Git repository found.');
+            this.showWarning('AOH - Git: no Git repository found.');
             return;
         }
 
@@ -835,7 +842,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                 case 'create': {
                     const name = await this.askBranchName('Create Branch', current ? `Create from ${current}` : undefined);
                     if (!name) return;
-                    await execFileAsync('git', ['switch', '-c', name], { cwd });
+                    await execFileAsync('git', ['switch', '--no-track', '-c', name], { cwd });
                     break;
                 }
 
@@ -843,7 +850,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                     if (!branch) return;
                     const name = await this.askBranchName('New Branch from Here', `Create from ${branch}`);
                     if (!name) return;
-                    await execFileAsync('git', ['switch', '-c', name, branch], { cwd });
+                    await execFileAsync('git', ['switch', '--no-track', '-c', name, branch], { cwd });
                     break;
                 }
 
@@ -856,11 +863,11 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                 case 'delete': {
                     if (!branch) return;
                     if (branch === current) {
-                        vscode.window.showWarningMessage(`AOH - Git: cannot delete the currently checked out branch "${branch}".`);
+                        this.showWarning(`AOH - Git: cannot delete the currently checked out branch "${branch}".`);
                         return;
                     }
 
-                    const answer = await vscode.window.showWarningMessage(
+                    const answer = await this.showWarning(
                         `Delete local branch "${branch}"?`,
                         { modal: true },
                         'Delete'
@@ -873,7 +880,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
 
                 case 'deleteRemote': {
                     if (!remote || !remoteBranch) return;
-                    const answer = await vscode.window.showWarningMessage(
+                    const answer = await this.showWarning(
                         `Delete remote branch "${remote}/${remoteBranch}"?`,
                         { modal: true },
                         'Delete Remote Branch'
@@ -896,17 +903,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                     const pushTarget = await this.resolvePushTarget(repo, remote);
                     if (!pushTarget) return;
 
-                    if (pushTarget.publish) {
-                        await execFileAsync(
-                            'git',
-                            ['push', '--set-upstream', pushTarget.remote, pushTarget.branch],
-                            { cwd }
-                        );
-                    } else if (remote) {
-                        await execFileAsync('git', ['push', remote, pushTarget.branch], { cwd });
-                    } else {
-                        await repo.push();
-                    }
+                    await execFileAsync('git', pushArguments(pushTarget), { cwd });
                     break;
                 }
             }
@@ -914,7 +911,8 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
             await repo.status();
             await this.refresh();
         } catch (err) {
-            const text = err instanceof Error ? err.message : String(err);
+            this.logError(`${action} repo=${cwd} branch=${current ?? '(detached)'}`, err);
+            const text = this.errorText(err);
             vscode.window.showErrorMessage(`AOH - Git: ${text}`);
         }
     }
@@ -923,39 +921,41 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         repo: Repository,
         requestedRemote?: string
     ): Promise<{ branch: string; remote: string; publish: boolean } | undefined> {
+        await repo.status();
         const branch = repo.state.HEAD?.name;
         if (!branch) {
-            vscode.window.showWarningMessage('AOH - Git: cannot push a detached HEAD.');
+            this.showWarning('AOH - Git: cannot push a detached HEAD.');
             return undefined;
         }
 
         const upstream = repo.state.HEAD?.upstream;
-        if (upstream) {
+        if (!needsPublication(branch, upstream, requestedRemote)) {
             return {
                 branch,
-                remote: requestedRemote ?? upstream.remote,
+                remote: requestedRemote ?? upstream!.remote,
                 publish: false
             };
         }
 
-        let remote = requestedRemote;
+        let remote = requestedRemote ?? upstream?.remote;
         if (!remote) {
             try {
                 const { stdout } = await execFileAsync('git', ['remote'], { cwd: repo.rootUri.fsPath });
                 const remotes = stdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
                 remote = remotes.includes('origin') ? 'origin' : remotes[0];
-            } catch {
-                remote = undefined;
+            } catch (error) {
+                this.logError('push: list remotes', error);
+                throw error;
             }
         }
 
         if (!remote) {
-            vscode.window.showWarningMessage('AOH - Git: no remote is configured for this repository.');
+            this.showWarning('AOH - Git: no remote is configured for this repository.');
             return undefined;
         }
 
         const answer = await vscode.window.showInformationMessage(
-            `The branch "${branch}" has no remote branch. Publish this branch?`,
+            `Publish "${branch}" to "${remote}/${branch}" and set it as upstream?${upstream ? ` Current upstream: ${upstream.remote}/${upstream.name}.` : ' No upstream is configured.'} No commit is created by publishing; Commit & Push will commit the selected files after confirmation.`,
             { modal: true },
             'Publish Branch'
         );
@@ -993,7 +993,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         }
 
         if (!files.length) {
-            vscode.window.showWarningMessage('Select at least one file before generating a commit message.');
+            this.showWarning('Select at least one file before generating a commit message.');
             return;
         }
 
@@ -1015,7 +1015,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
 
             const cleanDiff = String(diff).trim();
             if (!cleanDiff) {
-                vscode.window.showWarningMessage('The selected diff is empty.');
+                this.showWarning('The selected diff is empty.');
                 return;
             }
 
@@ -1053,6 +1053,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                 message: commitMessage
             });
         } catch (error) {
+            this.logError('AI commit message', error);
             const detail = error instanceof Error ? error.message : String(error);
             vscode.window.showErrorMessage(`AOH - Git: Could not generate a commit message. ${detail}`);
         } finally {
@@ -1071,17 +1072,17 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
     private async commit(repo: Repository, message: string, push: boolean, files: string[]): Promise<void> {
         const cleanMessage = message.trim();
         if (!cleanMessage) {
-            vscode.window.showWarningMessage('Enter a commit message first.');
+            this.showWarning('Enter a commit message first.');
             return;
         }
 
         if (!files.length) {
-            vscode.window.showWarningMessage('Select at least one file to commit.');
+            this.showWarning('Select at least one file to commit.');
             return;
         }
 
         if (push && vscode.workspace.getConfiguration('aoh.git').get<boolean>('confirmPush', false)) {
-            const answer = await vscode.window.showWarningMessage(
+            const answer = await this.showWarning(
                 `Commit and push "${cleanMessage}"?`,
                 { modal: true },
                 'Commit & Push'
@@ -1097,11 +1098,10 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         await commitSelection(repo, files, cleanMessage, () => {
             this.view?.webview.postMessage({ type: 'committed', repo: repo.rootUri.fsPath });
         }, pushTarget ? async () => {
-            if (pushTarget.publish) {
-                await execFileAsync('git', ['push', '--set-upstream', pushTarget.remote, pushTarget.branch],
-                    { cwd: repo.rootUri.fsPath });
-            } else {
-                await repo.push();
+            try {
+                await execFileAsync('git', pushArguments(pushTarget), { cwd: repo.rootUri.fsPath });
+            } catch (error) {
+                throw new Error(`The local commit was created, but push failed. Retry Push; no new commit is needed.\n${this.errorText(error)}`);
             }
         } : undefined);
     }

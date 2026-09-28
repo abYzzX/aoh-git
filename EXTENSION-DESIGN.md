@@ -86,3 +86,9 @@ The repository contains the extension source and package metadata, but intention
 ## Planned work
 
 Planned work should remain in issues rather than being treated as implemented behavior. Current known candidates include improving prune behavior so stale local branches can be cleaned up only when they are safely merged.
+
+### Push and diagnostics
+
+Branch creation uses `--no-track`; explicit remote checkout still establishes tracking. Push refreshes repository state and requires publication confirmation for missing/mismatched upstreams before commit selection mutates the index. Both push entry points use an explicit `HEAD:refs/heads/<branch>` refspec, independent of push.default or configured remote push refspecs. Publishing sets the upstream. Network failures after a successful commit explicitly report that the local commit remains.
+
+A native LogOutputChannel records warnings/errors and optional debug diagnostics without routine refresh messages. Error formatting includes CLI stderr and Git API codes, with URL authentication and authorization-header redaction.
