@@ -31,6 +31,12 @@ The extension invokes the Git executable for operations and data that are easier
 
 The main Changes/Stashes interface is implemented as a VS Code webview. Extension-host code owns Git access and filesystem-sensitive behavior; the webview owns rendering and interaction state. Messages crossing that boundary should remain explicit and narrowly scoped.
 
+`webview.ts` owns the HTML/CSS/JavaScript template. `gitApi.ts` and `gitStatus.ts` provide shared API types and status classification; the inactive legacy tree/commit implementations have been removed. Repository sections are replaced only when their rendered contents change. Expansion state and stash drafts survive replacement.
+
+`RefreshQueue` serializes refreshes, merges bursts into one pending run, and prevents superseded snapshots from being published. Identical snapshots are not resent. Read-only diff/open actions do not request another Git status refresh.
+
+`StashStore` reads only stash metadata during normal refreshes. File lists load on expansion, use NUL-delimited Git output, and are cached by repository and immutable stash hash. Caches are pruned when stashes or repositories disappear; diff inspection uses hashes so stash renumbering cannot redirect an open diff.
+
 ### File icon themes
 
 `FileIconThemeService` reads the active contributed VS Code file icon theme and resolves its file/folder mappings, resources, and icon fonts for use in the webview. Theme changes cause icon data to be reloaded.
@@ -39,7 +45,7 @@ The main Changes/Stashes interface is implemented as a VS Code webview. Extensio
 
 AI support executes a configurable external CLI. AOH - Git supplies Git context/diff input and consumes stdout as the proposed commit message. This avoids provider-specific SDK dependencies and allows Codex, Claude, Ollama wrappers, or custom tools to be used behind the same boundary.
 
-AI support is disabled by default and is not required for normal Git functionality.
+AI support is disabled by default and is not required for normal Git functionality. `ai.ts` owns CLI execution with a two-minute timeout, a 4 MiB combined output limit, and stdin error handling. On failure, POSIX commands are terminated through their dedicated process group (SIGTERM, then SIGKILL after one second); Windows uses `taskkill /T /F`. Cleanup finishes before the generation promise rejects, so the per-repository guard stays held during termination. POSIX descendants that explicitly create their own process group/session are outside this containment. `selectedDiff.ts` handles selection-based input, unborn repositories, literal pathspecs, and bounded reads of new files. Duplicate generation and commit requests are suppressed per repository.
 
 ## Safety rules
 
@@ -54,7 +60,7 @@ Prefer automated tests for deterministic logic such as Git output parsing, path 
 
 ## Repository build and release
 
-The repository contains the extension source and package metadata, but intentionally does not own a Gitea Actions pipeline or GitVersion configuration. Build/release orchestration is handled outside this repository. Local validation is performed with `npm test`.
+The repository contains the extension source and package metadata, but intentionally does not own a Gitea Actions pipeline or GitVersion configuration. Build/release orchestration is handled outside this repository. Local validation is performed with `npm test`, including temporary-repository Git integration tests, refresh scheduling, AI subprocess limits, status classification, and generated webview script syntax. Tests require Git on PATH.
 
 ## Known design constraints
 

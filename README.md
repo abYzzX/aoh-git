@@ -8,14 +8,13 @@ It provides a dedicated Git view with repository state, branch operations, stagi
 
 - Dedicated Changes and Stashes tabs
 - Stash creation with optional messages and untracked-file support
-- Expandable stash contents with file-level diff inspection
+- Expandable stash contents loaded on demand, with file-level diff inspection
 - Apply, pop, and drop stash actions
 - Multiple Git repositories in a workspace
 - Current branch and ahead/behind information
 - Tree and flat views for changed files
-- Stage and unstage individual files
-- Stage and unstage complete folders recursively
-- Stage or unstage complete change groups
+- Select individual files, whole folders, or complete change groups
+- Stage selected files automatically when committing
 - Open file diffs directly from the view
 - Commit and Commit & Push actions
 - Fetch and Pull actions in the view toolbar
@@ -47,9 +46,17 @@ Example configuration for the OpenAI Codex CLI:
 }
 ```
 
-The argument list may contain the placeholders `{Context}` and `{Diff}`. If neither placeholder is used, AOH sends the generated context and staged diff through standard input. This is generally preferable for large diffs and avoids command-line length limitations.
+The argument list may contain the placeholders `{Context}` and `{Diff}`. If neither placeholder is used, AOH sends the generated context and selected diff through standard input. This is generally preferable for large diffs and avoids command-line length limitations.
 
-The configured command must write the generated commit message to standard output.
+The configured command must write the generated commit message to standard output. AOH stops commands after two minutes or when combined stdout/stderr exceeds 4 MiB. Timeout and output-limit cleanup also terminates wrapper child processes. Only one generation runs per repository at a time, including during process cleanup.
+
+Generation uses the selected files, including new files before the first commit. Prompt input is limited to 120,000 characters; large untracked files are read only up to the remaining input budget.
+
+## View Updates
+
+Stash file lists and counts are loaded when a stash is expanded and cached until that stash disappears. Refreshes preserve folder/stash expansion, scroll position, and stash message drafts. Unchanged repository sections are reused.
+
+A successful commit clears the commit message even if a subsequent push fails. Use Push to retry the upload.
 
 ## Rollback
 

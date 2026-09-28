@@ -2,43 +2,40 @@
 
 All notable changes to AOH - Git will be documented in this file.
 
-## Unreleased
+## 0.1.2
 
-### Changed
-
+- Terminate AI wrapper subprocesses and their descendants on timeout or excessive output before allowing another generation.
+- Preserve stash filenames containing Unicode, tabs, newlines, or trailing spaces, and inspect stashes by immutable hash.
+- Correct type-change and merge-conflict colors in the Changes view.
+- Clear the commit message after a successful commit even when the subsequent push fails, and prevent duplicate commit submissions.
+- Generate AI messages before the first commit; handle early CLI exits, hung commands, and excessive output safely.
+- Preserve folder/stash expansion, scrolling, and stash message drafts across refreshes.
+- Load stash file lists only when expanded and reuse them across refreshes.
+- Coalesce overlapping refreshes, skip identical state updates, and reuse unchanged repository sections.
+- Share status definitions and branch parsers with the active view and remove unused legacy UI implementations.
 - Standardized the repository documentation structure around shared AOH rules and extension-specific design/agent documentation.
 - Added automated tests for deterministic Git branch-output parsing.
 - Repository-local Gitea Actions and GitVersion configuration are intentionally not part of this repository.
 
-## 2.4.4
+## 0.1.1
 - Use the active VS Code file icon theme for changed files and folders in the Changes webview.
 - Resolve icon-theme file/folder mappings (including expanded folders), SVG/PNG resources and icon-font glyphs from the contributing extension.
 - Reload icons automatically when the configured file icon theme or active color theme changes.
-
-## 2.4.3
 - Fix tree file indentation and render real file/folder icons in the Changes webview.
-
-## 2.4.2
 - Fixed file indentation in tree view so file rows align with sibling folder contents.
 - Added compact file-type icons for common source/config file extensions in Changes tree and flat views.
-
-## 2.3.1
-
 - Fix Tracked / Untracked grouping by classifying untracked files by Git status instead of relying on VS Code's optional untrackedChanges collection.
+
+## Earlier versions
+
 - Remove the Stage button; checkboxes are selection only and do not mutate the Git index.
 - Commit and Commit & Push stage only the selected files at commit time.
 - Prompt before publishing a local branch that has no upstream; confirmed publication uses git push --set-upstream.
-
-## 2.3.0
-
 - Changed the Changes view to group files as Tracked and Untracked.
 - Checkboxes now represent the AOH action selection and no longer stage/unstage immediately.
 - Added Stage action for staging only the currently selected files.
 - Commit and Commit & Push now synchronize the Git index with the selected files only when the commit is executed.
 - AI commit-message generation now uses the selected files instead of requiring pre-staged changes.
-
-## 2.2.0
-
 - Added a dedicated **Stashes** tab to the AOH Git view.
 - Added stash creation with an optional message and **Include untracked files** option.
 - Added expandable stash entries showing the files contained in each stash.
@@ -47,9 +44,6 @@ All notable changes to AOH - Git will be documented in this file.
 - Added **Apply**, **Pop**, and **Drop** actions for individual stashes.
 - Added confirmation before permanently dropping a stash.
 - Added multi-repository stash support.
-
-## 2.1.4
-
 - Added repository header with branch and ahead/behind information.
 - Added branch management directly from the Git view.
 - Added separate Staged Changes and Changes sections.
@@ -64,6 +58,4 @@ All notable changes to AOH - Git will be documented in this file.
 - Added support for multiple repositories in a workspace.
 - Improved layout and configurable spacing throughout the Git view.
 
-## Earlier versions
 
-Earlier development versions were created during the initial development of AOH Git and are not documented individually.

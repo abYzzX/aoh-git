@@ -1,0 +1,43 @@
+export enum Status {
+    INDEX_MODIFIED,
+    INDEX_ADDED,
+    INDEX_DELETED,
+    INDEX_RENAMED,
+    INDEX_COPIED,
+    MODIFIED,
+    DELETED,
+    UNTRACKED,
+    IGNORED,
+    INTENT_TO_ADD,
+    INTENT_TO_RENAME,
+    TYPE_CHANGED,
+    ADDED_BY_US,
+    ADDED_BY_THEM,
+    DELETED_BY_US,
+    DELETED_BY_THEM,
+    BOTH_ADDED,
+    BOTH_DELETED,
+    BOTH_MODIFIED
+}
+
+export const gitStatusClasses: Record<number, string> = {
+    [Status.INDEX_MODIFIED]: 'git-modified',
+    [Status.MODIFIED]: 'git-modified',
+    [Status.TYPE_CHANGED]: 'git-modified',
+    [Status.INDEX_ADDED]: 'git-added',
+    [Status.UNTRACKED]: 'git-added',
+    [Status.INTENT_TO_ADD]: 'git-added',
+    [Status.INDEX_DELETED]: 'git-deleted',
+    [Status.DELETED]: 'git-deleted',
+    [Status.INDEX_RENAMED]: 'git-renamed',
+    [Status.INDEX_COPIED]: 'git-renamed',
+    [Status.INTENT_TO_RENAME]: 'git-renamed',
+    [Status.IGNORED]: 'git-ignored',
+    [Status.ADDED_BY_US]: 'git-conflict',
+    [Status.ADDED_BY_THEM]: 'git-conflict',
+    [Status.DELETED_BY_US]: 'git-conflict',
+    [Status.DELETED_BY_THEM]: 'git-conflict',
+    [Status.BOTH_ADDED]: 'git-conflict',
+    [Status.BOTH_DELETED]: 'git-conflict',
+    [Status.BOTH_MODIFIED]: 'git-conflict'
+};

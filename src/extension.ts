@@ -1,79 +1,19 @@
-
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { execFile, spawn } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { FileIconThemeService } from './fileIconThemeService';
 
+import { Status, Change, Repository, GitAPI, GitExtension } from './gitApi';
+import { parseLocalBranches, parseRemoteBranches, splitRemoteBranch } from './gitOutput';
+import { renderWebview } from './webview';
+import { RefreshQueue } from './refreshQueue';
+import { StashStore } from './stashStore';
+import { runAi } from './ai';
+import { commitSelection } from './commit';
+import { selectedDiff, maxDiffChars } from './selectedDiff';
+
 const execFileAsync = promisify(execFile);
-
-enum Status {
-    INDEX_MODIFIED,
-    INDEX_ADDED,
-    INDEX_DELETED,
-    INDEX_RENAMED,
-    INDEX_COPIED,
-    MODIFIED,
-    DELETED,
-    UNTRACKED,
-    IGNORED,
-    INTENT_TO_ADD,
-    INTENT_TO_RENAME,
-    TYPE_CHANGED,
-    ADDED_BY_US,
-    ADDED_BY_THEM,
-    DELETED_BY_US,
-    DELETED_BY_THEM,
-    BOTH_ADDED,
-    BOTH_DELETED,
-    BOTH_MODIFIED
-}
-
-interface Change {
-    readonly uri: vscode.Uri;
-    readonly originalUri: vscode.Uri;
-    readonly renameUri: vscode.Uri | undefined;
-    readonly status: Status;
-}
-
-interface Branch {
-    readonly name?: string;
-    readonly upstream?: { remote: string; name: string; };
-    readonly ahead?: number;
-    readonly behind?: number;
-}
-
-interface RepositoryState {
-    readonly HEAD: Branch | undefined;
-    readonly indexChanges: Change[];
-    readonly workingTreeChanges: Change[];
-    readonly untrackedChanges: Change[];
-    readonly mergeChanges: Change[];
-    readonly onDidChange: vscode.Event<void>;
-}
-
-interface Repository {
-    readonly rootUri: vscode.Uri;
-    readonly state: RepositoryState;
-    add(paths: string[]): Promise<void>;
-    restore(paths: string[], options?: { staged?: boolean; ref?: string }): Promise<void>;
-    commit(message: string, opts?: { all?: boolean | 'tracked'; postCommitCommand?: string | null }): Promise<void>;
-    push(remoteName?: string, branchName?: string, setUpstream?: boolean): Promise<void>;
-    status(): Promise<void>;
-}
-
-interface GitAPI {
-    readonly repositories: Repository[];
-    readonly onDidOpenRepository: vscode.Event<Repository>;
-    readonly onDidCloseRepository: vscode.Event<Repository>;
-    toGitUri(uri: vscode.Uri, ref: string): vscode.Uri;
-}
-
-interface GitExtension {
-    readonly enabled: boolean;
-    readonly onDidChangeEnablement: vscode.Event<boolean>;
-    getAPI(version: 1): GitAPI;
-}
 
 type WebMessage =
     | { type: 'ready' }
@@ -89,6 +29,7 @@ type WebMessage =
     | { type: 'rollback'; repo: string; files: string[] }
     | { type: 'createStash'; repo: string; message: string; includeUntracked: boolean }
     | { type: 'stashAction'; repo: string; action: 'apply' | 'pop' | 'drop'; ref: string }
+    | { type: 'loadStash'; repo: string; hash: string }
     | { type: 'stashDiff'; repo: string; ref: string; file: string; untracked: boolean }
     | { type: 'debug'; message: string };
 
@@ -107,6 +48,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     const provider = new BetterGitViewProvider(context, context.extensionUri, gitExtension, output);
     context.subscriptions.push(
+        provider,
         vscode.window.registerWebviewViewProvider('aoh.git.view', provider, {
             webviewOptions: { retainContextWhenHidden: true }
         }),
@@ -127,10 +69,17 @@ export function activate(context: vscode.ExtensionContext) {
     );
 }
 
-class BetterGitViewProvider implements vscode.WebviewViewProvider {
+class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
     private view?: vscode.WebviewView;
     private api?: GitAPI;
+    private enablementSubscription?: vscode.Disposable;
     private repoSubscriptions: vscode.Disposable[] = [];
+    private readonly refreshQueue = new RefreshQueue(() => this.refreshState());
+    private readonly stashStore = new StashStore();
+    private readonly loadingStashes = new Set<string>();
+    private readonly generatingRepos = new Set<string>();
+    private readonly committingRepos = new Set<string>();
+    private lastState = '';
     private readonly fileIconTheme: FileIconThemeService;
 
     constructor(
@@ -145,11 +94,16 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
     async resolveWebviewView(view: vscode.WebviewView): Promise<void> {
         this.output.appendLine('[webview] Resolving AOH Git view.');
         this.view = view;
+        this.lastState = '';
         await this.fileIconTheme.load(view.webview);
         this.applyWebviewOptions();
-        view.webview.html = this.html(view.webview);
+        view.webview.html = renderWebview(view.webview);
 
-        view.webview.onDidReceiveMessage((message: WebMessage) => this.handle(message));
+        const messages = view.webview.onDidReceiveMessage((message: WebMessage) => this.handle(message));
+        view.onDidDispose(() => {
+            messages.dispose();
+            if (this.view === view) this.view = undefined;
+        });
 
         try {
             await this.ensureGit();
@@ -159,13 +113,13 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             this.logError('resolveWebviewView', err);
         }
 
-        const git = this.gitExtension.exports;
-        git.onDidChangeEnablement(() => {
-            this.ensureGit().then(() => {
-                this.bindRepositories();
-                this.refresh();
-            });
-        });
+    }
+
+    dispose(): void {
+        this.refreshQueue.dispose();
+        for (const subscription of this.repoSubscriptions) subscription.dispose();
+        this.repoSubscriptions = [];
+        this.view = undefined;
     }
 
     async reloadFileIconTheme(): Promise<void> {
@@ -191,11 +145,21 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             this.output.appendLine('[git] Activating built-in Git extension.');
             await this.gitExtension.activate();
         }
+        if (!this.enablementSubscription) {
+            this.enablementSubscription = this.gitExtension.exports.onDidChangeEnablement(() => {
+                void this.ensureGit().then(() => {
+                    this.bindRepositories();
+                    return this.refresh();
+                }).catch(error => this.logError('git', error));
+            });
+            this.context.subscriptions.push(this.enablementSubscription);
+        }
         if (this.gitExtension.exports.enabled) {
             const api = this.gitExtension.exports.getAPI(1);
             this.api = api;
             this.output.appendLine(`[git] API ready. repositories=${api.repositories.length}`);
         } else {
+            this.api = undefined;
             this.output.appendLine('[git] Built-in Git extension is disabled.');
         }
     }
@@ -219,11 +183,15 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 this.repoSubscriptions.push(repo.state.onDidChange(() => this.refresh()));
                 this.refresh();
             }),
-            this.api.onDidCloseRepository(() => this.refresh())
+            this.api.onDidCloseRepository(() => { this.bindRepositories(); void this.refresh(); })
         );
     }
 
-    async refresh(): Promise<void> {
+    refresh(): Promise<void> {
+        return this.refreshQueue.request();
+    }
+
+    private async refreshState(): Promise<void> {
         if (!this.view) {
             this.output.appendLine('[refresh] Skipped: webview not resolved yet.');
             return;
@@ -231,100 +199,91 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
 
         try {
             const repositories = this.api?.repositories ?? [];
+            this.stashStore.retain(new Set(repositories.map(repo => repo.rootUri.fsPath)));
             this.output.appendLine(`[refresh] Start. repositories=${repositories.length}`);
             const listItemSpacing = vscode.workspace.getConfiguration('aoh.git').get<number>('listItemSpacing', 2);
             const viewMode = this.context.workspaceState.get<'flat' | 'tree'>('aoh.git.viewMode', 'flat');
             const aiEnabled = vscode.workspace.getConfiguration('aoh.git').get<boolean>('ai.enabled', false);
 
             const repositoryStates = await Promise.all(repositories.map(async repo => {
-            const root = repo.rootUri.fsPath;
-            const allChanges = this.dedupe([
-                ...repo.state.workingTreeChanges,
-                ...repo.state.mergeChanges,
-                ...repo.state.indexChanges,
-                ...repo.state.untrackedChanges
-            ]);
-
-            // Some versions of VS Code's built-in Git extension expose untracked files
-            // only through workingTreeChanges. Classify by Git status instead of relying
-            // on the optional untrackedChanges collection so the Tracked / Untracked
-            // split remains correct.
-            const untracked = allChanges.filter(change => change.status === Status.UNTRACKED);
-            const tracked = allChanges.filter(change => change.status !== Status.UNTRACKED);
-            const stagedFiles = repo.state.indexChanges.map(change => change.uri.fsPath);
-            const stagedPathSet = new Set(stagedFiles.map(file => path.normalize(file)));
-            const workingPathSet = new Set([...repo.state.workingTreeChanges, ...repo.state.mergeChanges, ...repo.state.untrackedChanges].map(change => path.normalize(change.uri.fsPath)));
-
-            let branches: string[] = [];
-            let remotes: Array<{ name: string; branches: string[] }> = [];
-            try {
-                const [{ stdout: localStdout }, { stdout: remoteStdout }, { stdout: remoteNamesStdout }] = await Promise.all([
-                    execFileAsync(
-                        'git',
-                        ['for-each-ref', '--format=%(refname:short)', 'refs/heads/'],
-                        { cwd: root }
-                    ),
-                    execFileAsync(
-                        'git',
-                        ['for-each-ref', '--format=%(refname:short)|%(symref)', 'refs/remotes/'],
-                        { cwd: root }
-                    ),
-                    execFileAsync('git', ['remote'], { cwd: root })
+                const root = repo.rootUri.fsPath;
+                const allChanges = this.dedupe([
+                    ...repo.state.workingTreeChanges,
+                    ...repo.state.mergeChanges,
+                    ...repo.state.indexChanges,
+                    ...(repo.state.untrackedChanges ?? [])
                 ]);
 
-                branches = localStdout
-                    .split(/\r?\n/)
-                    .map(branch => branch.trim())
-                    .filter(Boolean)
-                    .sort((a, b) => a.localeCompare(b));
+                // Some versions of VS Code's built-in Git extension expose untracked files
+                // only through workingTreeChanges. Classify by Git status instead of relying
+                // on the optional untrackedChanges collection so the Tracked / Untracked
+                // split remains correct.
+                const untracked = allChanges.filter(change => change.status === Status.UNTRACKED);
+                const tracked = allChanges.filter(change => change.status !== Status.UNTRACKED);
+                const stagedFiles = repo.state.indexChanges.map(change => change.uri.fsPath);
+                const stagedPathSet = new Set(stagedFiles.map(file => path.normalize(file)));
+                const workingPathSet = new Set([...repo.state.workingTreeChanges, ...repo.state.mergeChanges, ...(repo.state.untrackedChanges ?? [])].map(change => path.normalize(change.uri.fsPath)));
 
-                const remoteMap = new Map<string, string[]>();
-                for (const line of remoteStdout.split(/\r?\n/)) {
-                    const trimmed = line.trim();
-                    if (!trimmed) continue;
+                let branches: string[] = [];
+                let remotes: Array<{ name: string; branches: string[] }> = [];
+                try {
+                    const [{ stdout: localStdout }, { stdout: remoteStdout }, { stdout: remoteNamesStdout }] = await Promise.all([
+                        execFileAsync(
+                            'git',
+                            ['for-each-ref', '--format=%(refname:short)', 'refs/heads/'],
+                            { cwd: root }
+                        ),
+                        execFileAsync(
+                            'git',
+                            ['for-each-ref', '--format=%(refname:short)|%(symref)', 'refs/remotes/'],
+                            { cwd: root }
+                        ),
+                        execFileAsync('git', ['remote'], { cwd: root })
+                    ]);
 
-                    const [shortName, symref] = trimmed.split('|', 2);
-                    if (symref) continue; // Ignore origin/HEAD-style symbolic refs.
+                    branches = parseLocalBranches(localStdout);
 
-                    const slash = shortName.indexOf('/');
-                    if (slash <= 0 || slash === shortName.length - 1) continue;
+                    const remoteMap = new Map<string, string[]>();
+                    for (const shortName of parseRemoteBranches(remoteStdout)) {
+                        const { remote, branch: remoteBranch } = splitRemoteBranch(shortName);
+                        if (!remote) continue;
+                        const list = remoteMap.get(remote) ?? [];
+                        list.push(remoteBranch);
+                        remoteMap.set(remote, list);
+                    }
 
-                    const remote = shortName.slice(0, slash);
-                    const remoteBranch = shortName.slice(slash + 1);
-                    const list = remoteMap.get(remote) ?? [];
-                    list.push(remoteBranch);
-                    remoteMap.set(remote, list);
+                    const remoteNames = remoteNamesStdout
+                        .split(/\r?\n/)
+                        .map(name => name.trim())
+                        .filter(Boolean);
+
+                    remotes = remoteNames.map(name => ({
+                        name,
+                        branches: (remoteMap.get(name) ?? []).sort((a, b) => a.localeCompare(b))
+                    }));
+                } catch (err) {
+                    this.output.appendLine(`[refresh] Branch enumeration failed for ${root}: ${this.errorText(err)}`);
+                    // Keep the view usable even if branch enumeration fails temporarily.
                 }
 
-                const remoteNames = remoteNamesStdout
-                    .split(/\r?\n/)
-                    .map(name => name.trim())
-                    .filter(Boolean);
-
-                remotes = remoteNames.map(name => ({
-                    name,
-                    branches: (remoteMap.get(name) ?? []).sort((a, b) => a.localeCompare(b))
-                }));
-            } catch (err) {
-                this.output.appendLine(`[refresh] Branch enumeration failed for ${root}: ${this.errorText(err)}`);
-                // Keep the view usable even if branch enumeration fails temporarily.
-            }
-
-            return {
-                root,
-                name: path.basename(root),
-                branch: repo.state.HEAD?.name ?? 'detached HEAD',
-                branches,
-                remotes,
-                ahead: repo.state.HEAD?.ahead ?? 0,
-                behind: repo.state.HEAD?.behind ?? 0,
-                hasUpstream: !!repo.state.HEAD?.upstream,
-                tracked: tracked.map(c => ({ ...this.serializeChange(root, c, this.view!.webview), stagedOnly: stagedPathSet.has(path.normalize(c.uri.fsPath)) && !workingPathSet.has(path.normalize(c.uri.fsPath)) })),
-                untracked: untracked.map(c => ({ ...this.serializeChange(root, c, this.view!.webview), stagedOnly: false })),
-                stagedFiles,
-                stashes: await this.readStashes(root, this.view!.webview)
-            };
-        }));
+                return {
+                    root,
+                    name: path.basename(root),
+                    branch: repo.state.HEAD?.name ?? 'detached HEAD',
+                    branches,
+                    remotes,
+                    ahead: repo.state.HEAD?.ahead ?? 0,
+                    behind: repo.state.HEAD?.behind ?? 0,
+                    hasUpstream: !!repo.state.HEAD?.upstream,
+                    tracked: tracked.map(c => ({ ...this.serializeChange(root, c, this.view!.webview), stagedOnly: stagedPathSet.has(path.normalize(c.uri.fsPath)) && !workingPathSet.has(path.normalize(c.uri.fsPath)) })),
+                    untracked: untracked.map(c => ({ ...this.serializeChange(root, c, this.view!.webview), stagedOnly: false })),
+                    stagedFiles,
+                    stashes: await this.stashStore.list(root).catch(error => {
+                        this.output.appendLine(`[stash] Failed to list stashes: ${this.errorText(error)}`);
+                        return [];
+                    })
+                };
+            }));
 
             const folderNames = new Set<string>();
             for (const repoState of repositoryStates) {
@@ -337,7 +296,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 [...folderNames].map(name => [name.toLowerCase(), this.fileIconTheme.resolveFolder(this.view!.webview, name)])
             );
 
-            const posted = await this.view.webview.postMessage({
+            const state = {
                 type: 'state',
                 listItemSpacing,
                 viewMode,
@@ -348,9 +307,15 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                     folders: folderIcons
                 },
                 repositories: repositoryStates
-            });
+            };
+            if (!this.view || this.refreshQueue.superseded) return;
+            const serialized = JSON.stringify(state);
+            if (serialized === this.lastState) return;
+            const posted = await this.view.webview.postMessage(state);
+            if (posted) this.lastState = serialized;
             this.output.appendLine(`[refresh] State posted=${posted}; repositories=${repositoryStates.length}; viewMode=${viewMode}`);
         } catch (err) {
+            this.lastState = '';
             this.logError('refresh', err);
             this.view?.webview.postMessage({ type: 'fatalError', message: this.errorText(err) });
         }
@@ -389,73 +354,12 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         };
     }
 
-    private async readStashes(root: string, webview: vscode.Webview) {
-        try {
-            const { stdout } = await execFileAsync(
-                'git',
-                ['stash', 'list', '--format=%gd%x1f%H%x1f%ct%x1f%gs'],
-                { cwd: root, maxBuffer: 10 * 1024 * 1024 }
-            );
-
-            const entries = stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-            return await Promise.all(entries.map(async line => {
-                const [ref, hash, timestamp, ...messageParts] = line.split('\x1f');
-                const message = messageParts.join('\x1f');
-                const untracked = new Set<string>();
-
-                try {
-                    const { stdout: untrackedStdout } = await execFileAsync(
-                        'git',
-                        ['ls-tree', '-r', '--name-only', `${ref}^3`],
-                        { cwd: root, maxBuffer: 10 * 1024 * 1024 }
-                    );
-                    for (const file of untrackedStdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
-                        untracked.add(file);
-                    }
-                } catch {
-                    // A stash only has a third parent when untracked files were included.
-                }
-
-                const { stdout: filesStdout } = await execFileAsync(
-                    'git',
-                    ['stash', 'show', '--include-untracked', '--name-status', '--format=', '--no-renames', ref],
-                    { cwd: root, maxBuffer: 10 * 1024 * 1024 }
-                );
-
-                const files = filesStdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean).map(value => {
-                    const tab = value.indexOf('\t');
-                    const status = tab >= 0 ? value.slice(0, tab) : 'M';
-                    const relativePath = tab >= 0 ? value.slice(tab + 1) : value;
-                    return {
-                        path: relativePath,
-                        name: path.basename(relativePath),
-                        dir: path.dirname(relativePath) === '.' ? '' : path.dirname(relativePath),
-                        status,
-                        untracked: untracked.has(relativePath),
-                        icon: this.fileIconTheme.resolveFile(webview, path.join(root, relativePath))
-                    };
-                });
-
-                return {
-                    ref,
-                    hash,
-                    timestamp: Number(timestamp) || 0,
-                    message,
-                    files
-                };
-            }));
-        } catch (err) {
-            this.output.appendLine(`[stash] Failed to enumerate stashes for ${root}: ${this.errorText(err)}`);
-            return [];
-        }
-    }
-
     private untrackedPathSet(repo: Repository): Set<string> {
         return new Set(
             [
                 ...repo.state.workingTreeChanges,
                 ...repo.state.mergeChanges,
-                ...repo.state.untrackedChanges
+                ...(repo.state.untrackedChanges ?? [])
             ]
                 .filter(change => change.status === Status.UNTRACKED)
                 .map(change => path.normalize(change.uri.fsPath))
@@ -488,6 +392,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         }
 
         if (message.type === 'ready' || message.type === 'refresh') {
+            if (message.type === 'ready') this.lastState = '';
             this.output.appendLine(`[webview] ${message.type}`);
             this.refresh();
             return;
@@ -516,9 +421,24 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
 
         try {
             switch (message.type) {
+                case 'loadStash': {
+                    const key = JSON.stringify([message.repo, message.hash]);
+                    if (this.loadingStashes.has(key)) return;
+                    this.loadingStashes.add(key);
+                    try {
+                        await this.stashStore.load(message.repo, message.hash);
+                        await this.refresh();
+                    } catch (error) {
+                        this.view?.webview.postMessage({ type: 'stashLoadError', repo: message.repo, hash: message.hash });
+                        throw error;
+                    } finally {
+                        this.loadingStashes.delete(key);
+                    }
+                    return;
+                }
                 case 'open':
                     await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(message.file));
-                    break;
+                    return;
                 case 'diff': {
                     const uri = vscode.Uri.file(message.file);
                     const title = `${path.basename(message.file)} (${message.staged ? 'Index' : 'Working Tree'})`;
@@ -529,13 +449,13 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                     // untracked files have no left-hand side, so VS Code opens the file.
                     if (!message.staged && message.status === Status.UNTRACKED) {
                         await vscode.commands.executeCommand('vscode.open', uri);
-                        break;
+                        return;
                     }
 
                     const left = this.api!.toGitUri(uri, message.staged ? 'HEAD' : '~');
                     const right = message.staged ? this.api!.toGitUri(uri, '') : uri;
                     await vscode.commands.executeCommand('vscode.diff', left, right, title);
-                    break;
+                    return;
                 }
                 case 'rollback':
                     await this.rollback(repo, message.files);
@@ -548,16 +468,29 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'stashDiff':
                     await this.openStashDiff(repo, message.ref, message.file, message.untracked);
-                    break;
+                    return;
                 case 'generateCommitMessage':
-                    await this.generateCommitMessage(repo, message.files);
-                    break;
+                    if (this.generatingRepos.has(message.repo)) return;
+                    this.generatingRepos.add(message.repo);
+                    try { await this.generateCommitMessage(repo, message.files); }
+                    finally {
+                        this.generatingRepos.delete(message.repo);
+                        this.view?.webview.postMessage({ type: 'commitMessageGeneration', repo: message.repo, running: false });
+                    }
+                    return;
                 case 'commit':
-                    await this.commit(repo, message.message, false, message.files);
-                    break;
                 case 'commitPush':
-                    await this.commit(repo, message.message, true, message.files);
-                    break;
+                    if (this.committingRepos.has(message.repo)) return;
+                    this.committingRepos.add(message.repo);
+                    try {
+                        await this.commit(repo, message.message, message.type === 'commitPush', message.files);
+                    } finally {
+                        this.committingRepos.delete(message.repo);
+                        this.view?.webview.postMessage({ type: 'commitFinished', repo: message.repo });
+                        await repo.status();
+                        await this.refresh();
+                    }
+                    return;
             }
             await repo.status();
             this.refresh();
@@ -693,11 +626,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             );
 
             const current = targetRepo.state.HEAD?.name;
-            const branches = stdout
-                .split(/\r?\n/)
-                .map(b => b.trim())
-                .filter(Boolean)
-                .sort((a, b) => a.localeCompare(b));
+            const branches = parseLocalBranches(stdout);
 
             const createLabel = '$(add) Create new branch…';
             const picked = await vscode.window.showQuickPick(
@@ -983,7 +912,6 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
                 return;
             }
 
-            const maxDiffChars = 120_000;
             const truncated = cleanDiff.length > maxDiffChars;
             const diffForPrompt = truncated ? cleanDiff.slice(0, maxDiffChars) : cleanDiff;
 
@@ -1006,7 +934,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
             const configuredArgs = config.get<string[]>('ai.arguments', ['exec', '--color', 'never', '-']);
             const args = Array.isArray(configuredArgs) ? configuredArgs : [];
 
-            const generated = await this.runAi(command, args, cwd, context, diffForPrompt);
+            const generated = await runAi(command, args, cwd, context, diffForPrompt);
             const commitMessage = generated.trim();
             if (!commitMessage) {
                 throw new Error('AI command returned an empty commit message.');
@@ -1029,72 +957,8 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private runAi(command: string, configuredArgs: string[], cwd: string, context: string, diff: string): Promise<string> {
-        return new Promise((resolve, reject) => {
-            const usesPlaceholder = configuredArgs.some(arg => arg.includes('{Context}') || arg.includes('{Diff}'));
-            const args = configuredArgs.map(arg =>
-                arg.replaceAll('{Context}', context).replaceAll('{Diff}', diff)
-            );
-
-            const child = spawn(command, args, {
-                cwd,
-                env: process.env,
-                stdio: ['pipe', 'pipe', 'pipe'],
-                windowsHide: true
-            });
-
-            let stdout = '';
-            let stderr = '';
-            child.stdout.setEncoding('utf8');
-            child.stderr.setEncoding('utf8');
-            child.stdout.on('data', chunk => stdout += chunk);
-            child.stderr.on('data', chunk => stderr += chunk);
-
-            child.on('error', error => {
-                if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-                    reject(new Error(`AI command '${command}' was not found. Configure aoh.git.ai.command.`));
-                    return;
-                }
-                reject(error);
-            });
-
-            child.on('close', code => {
-                if (code === 0) {
-                    resolve(stdout);
-                    return;
-                }
-                reject(new Error(stderr.trim() || stdout.trim() || `AI command exited with code ${code ?? 'unknown'}.`));
-            });
-
-            if (usesPlaceholder) {
-                child.stdin.end();
-            } else {
-                child.stdin.end(`${context}\n\nStaged diff:\n${diff}`);
-            }
-        });
-    }
-
     private async diffForFiles(repo: Repository, files: string[]): Promise<{ stdout: string; stderr: string }> {
-        const root = repo.rootUri.fsPath;
-        const relativeFiles = files.map(file => path.relative(root, file));
-        const { stdout } = await execFileAsync(
-            'git',
-            ['diff', 'HEAD', '--no-ext-diff', '--unified=3', '--', ...relativeFiles],
-            { cwd: root, maxBuffer: 4 * 1024 * 1024 }
-        );
-
-        const untracked = this.untrackedPathSet(repo);
-        const untrackedText: string[] = [];
-        for (const file of files.filter(file => untracked.has(path.normalize(file)))) {
-            try {
-                const document = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
-                untrackedText.push(`diff --git a/${path.relative(root, file)} b/${path.relative(root, file)}\nnew file\n${document.getText()}`);
-            } catch {
-                // Ignore unreadable/binary untracked files in the AI prompt.
-            }
-        }
-
-        return { stdout: [String(stdout).trim(), ...untrackedText].filter(Boolean).join('\n\n'), stderr: '' };
+        return { stdout: await selectedDiff(repo.rootUri.fsPath, files, this.untrackedPathSet(repo)), stderr: '' };
     }
 
     private async commit(repo: Repository, message: string, push: boolean, files: string[]): Promise<void> {
@@ -1123,1224 +987,18 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider {
         const pushTarget = push ? await this.resolvePushTarget(repo) : undefined;
         if (push && !pushTarget) return;
 
-        const selected = new Set(files.map(file => path.normalize(file)));
-        const stagedButNotSelected = repo.state.indexChanges
-            .map(change => change.uri.fsPath)
-            .filter(file => !selected.has(path.normalize(file)));
-
-        // The checkboxes represent AOH selection, not the Git index. Only now, at the
-        // definitive commit action, synchronize the index with that selection.
-        if (stagedButNotSelected.length) {
-            await repo.restore(stagedButNotSelected, { staged: true });
-        }
-        await repo.add(files);
-        await repo.commit(cleanMessage, { postCommitCommand: null });
-
-        if (push && pushTarget) {
+        await commitSelection(repo, files, cleanMessage, () => {
+            this.view?.webview.postMessage({ type: 'committed', repo: repo.rootUri.fsPath });
+        }, pushTarget ? async () => {
             if (pushTarget.publish) {
-                await execFileAsync(
-                    'git',
-                    ['push', '--set-upstream', pushTarget.remote, pushTarget.branch],
-                    { cwd: repo.rootUri.fsPath }
-                );
+                await execFileAsync('git', ['push', '--set-upstream', pushTarget.remote, pushTarget.branch],
+                    { cwd: repo.rootUri.fsPath });
             } else {
                 await repo.push();
             }
-        }
-
-        this.view?.webview.postMessage({ type: 'committed', repo: repo.rootUri.fsPath });
+        } : undefined);
     }
 
-    private html(webview: vscode.Webview): string {
-        const nonce = getNonce();
-        return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; font-src ${webview.cspSource}; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-:root { --list-item-spacing: 2px; }
-* { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
-body {
-    color: var(--vscode-foreground);
-    background: var(--vscode-sideBar-background);
-    font-family: var(--vscode-font-family);
-    font-size: var(--vscode-font-size);
-}
-#app {
-    height: 100%;
-    display: flex;
-    flex-direction: column;
-}
-#repos {
-    flex: 1 1 auto;
-    overflow: auto;
-    padding: 4px 8px 14px;
-}
-.empty {
-    color: var(--vscode-descriptionForeground);
-    padding: 16px 8px;
-    line-height: 1.5;
-}
-.repo { margin-bottom: 16px; }
-.repo-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-height: 34px;
-    padding: 4px 5px 7px;
-    border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border);
-}
-.repo-title {
-    font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.branch {
-    margin-left: auto;
-    color: var(--vscode-descriptionForeground);
-    white-space: nowrap;
-    font-size: 0.92em;
-    cursor: pointer;
-    padding: 3px 5px;
-    border-radius: 3px;
-}
-.branch:hover { background: var(--vscode-list-hoverBackground); color: var(--vscode-foreground); }
-.branch-wrap { position: relative; margin-left: auto; }
-.branch-wrap .branch { margin-left: 0; }
-.context-menu {
-    position: fixed;
-    z-index: 10000;
-    min-width: 170px;
-    padding: 4px 0;
-    border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border));
-    border-radius: 4px;
-    background: var(--vscode-menu-background, var(--vscode-dropdown-background));
-    color: var(--vscode-menu-foreground, var(--vscode-dropdown-foreground));
-    box-shadow: 0 4px 14px rgba(0, 0, 0, .3);
-}
-.context-menu.hidden { display: none; }
-.context-menu-item {
-    padding: 5px 24px 5px 10px;
-    white-space: nowrap;
-    cursor: default;
-}
-.context-menu-item:hover {
-    background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground));
-    color: var(--vscode-menu-selectionForeground, var(--vscode-foreground));
-}
-
-.branch-menu {
-    position: absolute;
-    z-index: 100;
-    top: calc(100% + 3px);
-    right: 0;
-    min-width: 210px;
-    padding: 4px 0;
-    border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border));
-    border-radius: 4px;
-    background: var(--vscode-menu-background, var(--vscode-dropdown-background));
-    color: var(--vscode-menu-foreground, var(--vscode-dropdown-foreground));
-    box-shadow: 0 4px 14px rgba(0,0,0,.28);
-}
-.branch-menu.hidden { display: none; }
-.branch-menu-separator {
-    height: 1px;
-    margin: 4px 0;
-    background: var(--vscode-menu-separatorBackground, var(--vscode-widget-border));
-}
-.branch-entry,
-.branch-action {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    min-height: 26px;
-    padding: 3px 9px;
-    white-space: nowrap;
-    cursor: default;
-    user-select: none;
-}
-.branch-entry:hover,
-.branch-action:hover { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); color: var(--vscode-menu-selectionForeground, var(--vscode-foreground)); }
-.branch-entry.current { font-weight: 600; }
-.branch-check { width: 13px; text-align: center; }
-.branch-entry-arrow { margin-left: auto; color: var(--vscode-descriptionForeground); }
-.branch-submenu {
-    display: none;
-    position: absolute;
-    z-index: 110;
-    top: -4px;
-    left: 100%;
-    right: auto;
-    min-width: 190px;
-    padding: 4px 0;
-    border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border));
-    border-radius: 4px;
-    background: var(--vscode-menu-background, var(--vscode-dropdown-background));
-    box-shadow: 0 4px 14px rgba(0,0,0,.28);
-}
-.branch-submenu.open { display: block; }
-.remote-entry {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    min-height: 26px;
-    padding: 3px 9px;
-    white-space: nowrap;
-    cursor: default;
-    user-select: none;
-}
-.remote-entry:hover { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); color: var(--vscode-menu-selectionForeground, var(--vscode-foreground)); }
-.remote-submenu.open { display: block; }
-.remote-submenu {
-    display: none;
-    position: absolute;
-    z-index: 115;
-    top: -4px;
-    left: 100%;
-    right: auto;
-    min-width: 210px;
-    padding: 4px 0;
-    border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border));
-    border-radius: 4px;
-    background: var(--vscode-menu-background, var(--vscode-dropdown-background));
-    box-shadow: 0 4px 14px rgba(0,0,0,.28);
-}
-.remote-branch-entry { position: relative; }
-
-
-.menu-header {
-    display: flex;
-    align-items: center;
-    min-height: 28px;
-    padding: 3px 9px;
-    font-weight: 600;
-    border-bottom: 1px solid var(--vscode-menu-separatorBackground, var(--vscode-widget-border));
-    cursor: pointer;
-    user-select: none;
-}
-.menu-header:hover { background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground)); }
-.branch-submenu, .remote-submenu {
-    top: -4px !important;
-    left: auto !important;
-    right: 0 !important;
-    min-width: 100% !important;
-}
-
-.branch-action.disabled { opacity: .45; pointer-events: none; }
-.tabs {
-    flex: 0 0 auto;
-    display: flex;
-    padding: 0 8px;
-    border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border);
-}
-.tab {
-    appearance: none;
-    min-height: 32px;
-    padding: 0 10px;
-    border: 0;
-    border-bottom: 2px solid transparent;
-    border-radius: 0;
-    background: transparent;
-    color: var(--vscode-descriptionForeground);
-}
-.tab:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground); }
-.tab.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
-.stash-create {
-    margin: 8px 5px 12px;
-    padding: 8px;
-    border: 1px solid var(--vscode-sideBarSectionHeader-border);
-    border-radius: 4px;
-}
-.stash-create-row { display: flex; gap: 6px; }
-.stash-message {
-    flex: 1;
-    min-width: 0;
-    height: 28px;
-    padding: 4px 7px;
-    border: 1px solid var(--vscode-input-border, transparent);
-    border-radius: 3px;
-    background: var(--vscode-input-background);
-    color: var(--vscode-input-foreground);
-    font: inherit;
-    outline: none;
-}
-.stash-message:focus { border-color: var(--vscode-focusBorder); }
-.stash-create-button { min-height: 28px; padding: 0 10px; }
-.stash-options { margin-top: 7px; color: var(--vscode-descriptionForeground); font-size: .9em; }
-.stash-options label { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
-.stash-card { margin: 8px 5px; border: 1px solid var(--vscode-sideBarSectionHeader-border); border-radius: 4px; overflow: hidden; }
-.stash-summary { display: flex; align-items: center; gap: 7px; min-height: 32px; padding: 4px 7px; cursor: pointer; list-style: none; }
-.stash-summary::-webkit-details-marker { display: none; }
-.stash-summary::before { content: '▸'; width: 12px; color: var(--vscode-descriptionForeground); }
-.stash-card[open] > .stash-summary::before { content: '▾'; }
-.stash-summary:hover { background: var(--vscode-list-hoverBackground); }
-.stash-title { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stash-ref { color: var(--vscode-descriptionForeground); font-size: .9em; }
-.stash-actions { display: flex; gap: 4px; padding: 6px 7px; border-top: 1px solid var(--vscode-sideBarSectionHeader-border); }
-.stash-action { min-height: 25px; padding: 0 8px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-.stash-files { border-top: 1px solid var(--vscode-sideBarSectionHeader-border); padding: 4px 0; }
-.stash-file { display: flex; align-items: baseline; gap: 8px; min-height: 26px; padding: 3px 8px; cursor: pointer; }
-.stash-file:hover { background: var(--vscode-list-hoverBackground); }
-.stash-status { width: 14px; flex: 0 0 14px; color: var(--vscode-descriptionForeground); font-weight: 600; }
-.stash-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stash-file-dir { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); font-size: .9em; }
-.stash-meta { color: var(--vscode-descriptionForeground); font-size: .85em; white-space: nowrap; }
-.group { margin-top: 8px; }
-.group-title {
-    display: flex;
-    align-items: center;
-    min-height: 30px;
-    padding: 0 5px;
-    font-weight: 600;
-    color: var(--vscode-sideBarSectionHeader-foreground);
-}
-.count {
-    margin-left: 7px;
-    color: var(--vscode-descriptionForeground);
-    font-weight: 400;
-}
-.group-spacer { flex: 1; }
-.group-check,
-.folder-check {
-    appearance: none;
-    width: 15px;
-    height: 15px;
-    flex: 0 0 15px;
-    margin: 0 7px 0 0;
-    border: 1px solid var(--vscode-checkbox-border);
-    border-radius: 3px;
-    background: var(--vscode-checkbox-background);
-    cursor: pointer;
-    position: relative;
-}
-.group-check:checked,
-.folder-check:checked {
-    background: var(--vscode-checkbox-selectBackground, var(--vscode-button-background));
-    border-color: var(--vscode-checkbox-selectBorder, var(--vscode-button-background));
-}
-.group-check:checked::after,
-.folder-check:checked::after {
-    content: "✓";
-    position: absolute;
-    inset: -4px 0 0 1px;
-    color: var(--vscode-checkbox-foreground, var(--vscode-button-foreground));
-    font-size: 15px;
-}
-.file-row {
-    min-height: 26px;
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    padding: 0 7px;
-    border-radius: 4px;
-    margin-bottom: var(--list-item-spacing);
-    cursor: default;
-}
-.file-row:hover { background: var(--vscode-list-hoverBackground); }
-.file-row:focus-within { background: var(--vscode-list-focusBackground); }
-.file-row.git-modified .file-name {
-    color: var(--vscode-gitDecoration-modifiedResourceForeground);
-}
-.file-row.git-added .file-name {
-    color: var(--vscode-gitDecoration-addedResourceForeground);
-}
-.file-row.git-deleted .file-name {
-    color: var(--vscode-gitDecoration-deletedResourceForeground);
-}
-.file-row.git-renamed .file-name {
-    color: var(--vscode-gitDecoration-renamedResourceForeground);
-}
-.file-row.git-conflict .file-name {
-    color: var(--vscode-gitDecoration-conflictingResourceForeground);
-}
-.file-row.git-ignored .file-name {
-    color: var(--vscode-gitDecoration-ignoredResourceForeground);
-}
-.file-check {
-    appearance: none;
-    width: 16px;
-    height: 16px;
-    flex: 0 0 16px;
-    border: 1px solid var(--vscode-checkbox-border);
-    border-radius: 3px;
-    background: var(--vscode-checkbox-background);
-    cursor: pointer;
-    position: relative;
-}
-.file-check:checked {
-    background: var(--vscode-checkbox-selectBackground, var(--vscode-button-background));
-    border-color: var(--vscode-checkbox-selectBorder, var(--vscode-button-background));
-}
-.file-check:checked::after {
-    content: "✓";
-    position: absolute;
-    inset: -3px 0 0 2px;
-    color: var(--vscode-checkbox-foreground, var(--vscode-button-foreground));
-    font-size: 15px;
-}
-.file-main {
-    min-width: 0;
-    flex: 1;
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    cursor: pointer;
-}
-.file-name {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.file-dir {
-    min-width: 0;
-    color: var(--vscode-descriptionForeground);
-    font-size: 0.9em;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.tree-root { padding-left: 0; }
-.tree-folder { margin: 0; }
-.tree-folder > summary {
-    min-height: 26px;
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    padding: 0 7px;
-    cursor: pointer;
-    user-select: none;
-    color: var(--vscode-foreground);
-    list-style: none;
-}
-.tree-folder > summary::-webkit-details-marker { display: none; }
-.tree-folder > summary::before {
-    content: "▾";
-    width: 12px;
-    color: var(--vscode-descriptionForeground);
-}
-.tree-folder:not([open]) > summary::before { content: "▸"; }
-.tree-folder > summary:hover { background: var(--vscode-list-hoverBackground); }
-.tree-children { padding-left: 14px; }
-.tree-file { padding-left: 24px; }
-.tree-file .file-main { gap: 6px; }
-.node-icon {
-    width: 16px;
-    height: 16px;
-    flex: 0 0 16px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    overflow: visible;
-}
-.node-icon img { width: 16px; height: 16px; display: block; object-fit: contain; }
-.node-icon-font { line-height: 16px; text-align: center; }
-.folder-icon-open { display: inline-flex; }
-.folder-icon-closed { display: none; }
-.tree-folder:not([open]) > summary .folder-icon-open { display: none; }
-.tree-folder:not([open]) > summary .folder-icon-closed { display: inline-flex; }
-.view-mode-label {
-    margin-left: auto;
-    color: var(--vscode-descriptionForeground);
-    font-size: 0.82em;
-    font-weight: 400;
-}
-.commit-area {
-    flex: 0 0 auto;
-    border-top: 1px solid var(--vscode-sideBarSectionHeader-border);
-    background: var(--vscode-sideBar-background);
-    padding: 10px;
-}
-.message-wrap {
-    position: relative;
-}
-textarea {
-    display: block;
-    width: 100%;
-    min-height: 82px;
-    max-height: 180px;
-    resize: vertical;
-    padding: 8px 38px 8px 9px;
-    border: 1px solid var(--vscode-input-border, transparent);
-    border-radius: 3px;
-    background: var(--vscode-input-background);
-    color: var(--vscode-input-foreground);
-    font: inherit;
-    outline: none;
-}
-textarea:focus { border-color: var(--vscode-focusBorder); }
-.ai-button {
-    position: absolute;
-    top: 6px;
-    right: 6px;
-    width: 26px;
-    height: 26px;
-    min-height: 0;
-    padding: 0;
-    border: 0;
-    border-radius: 4px;
-    background: transparent;
-    color: var(--vscode-descriptionForeground);
-    font-size: 16px;
-    line-height: 26px;
-    cursor: pointer;
-    opacity: .85;
-}
-.ai-button:hover {
-    background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
-    color: var(--vscode-foreground);
-    opacity: 1;
-}
-.ai-button:disabled {
-    opacity: .45;
-    cursor: default;
-}
-.ai-button.generating {
-    animation: ai-pulse 900ms ease-in-out infinite alternate;
-}
-@keyframes ai-pulse {
-    from { opacity: .35; transform: scale(.92); }
-    to { opacity: 1; transform: scale(1.08); }
-}
-.buttons {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 8px;
-}
-button {
-    min-height: 30px;
-    border: 1px solid transparent;
-    border-radius: 3px;
-    font: inherit;
-    cursor: pointer;
-}
-button.primary {
-    color: var(--vscode-button-foreground);
-    background: var(--vscode-button-background);
-}
-button.primary:hover { background: var(--vscode-button-hoverBackground); }
-button.secondary {
-    color: var(--vscode-button-secondaryForeground);
-    background: var(--vscode-button-secondaryBackground);
-}
-button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
-button:disabled { opacity: .55; cursor: default; }
-
-</style>
-<style id="file-icon-theme-fonts"></style>
-</head>
-<body>
-<div id="app">
-    <div class="tabs">
-        <button id="changesTab" class="tab active">Changes</button>
-        <button id="stashesTab" class="tab">Stashes</button>
-    </div>
-    <div id="repos"><div class="empty">Loading Git repositories…</div></div>
-    <div class="commit-area">
-        <div class="message-wrap">
-            <textarea id="message" placeholder="Commit message (Ctrl+Enter to commit)"></textarea>
-            <button
-                id="generateCommitMessage"
-                class="ai-button"
-                title="Generate commit message with AI"
-                aria-label="Generate commit message with AI">✦</button>
-        </div>
-        <div class="buttons">
-            <button id="commit" class="secondary">Commit</button>
-            <button id="commitPush" class="primary">Commit &amp; Push</button>
-        </div>
-    </div>
-</div>
-<div id="contextMenu" class="context-menu hidden">
-  <div id="rollbackContext" class="context-menu-item">Rollback</div>
-</div>
-<script nonce="${nonce}">
-const vscode = acquireVsCodeApi();
-const repos = document.getElementById('repos');
-const message = document.getElementById('message');
-const commit = document.getElementById('commit');
-const commitPush = document.getElementById('commitPush');
-const generateCommitMessage = document.getElementById('generateCommitMessage');
-const contextMenu = document.getElementById('contextMenu');
-const rollbackContext = document.getElementById('rollbackContext');
-const changesTab = document.getElementById('changesTab');
-const stashesTab = document.getElementById('stashesTab');
-const commitArea = document.querySelector('.commit-area');
-
-let contextTarget = null;
-let state = { repositories: [], aiEnabled: false };
-let activeRepo = '';
-let activeTab = 'changes';
-const selectedFiles = new Map();
-const initializedRepos = new Set();
-
-function debug(message) {
-    vscode.postMessage({ type: 'debug', message: String(message) });
-}
-window.addEventListener('error', event => debug('JS error: ' + event.message + ' @ ' + event.filename + ':' + event.lineno));
-window.addEventListener('unhandledrejection', event => debug('Unhandled rejection: ' + String(event.reason)));
-debug('Script initialized.');
-
-function esc(value) {
-    return String(value ?? '')
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;');
-}
-
-function repoForCommit() {
-    if (state.repositories.length === 1) return state.repositories[0];
-    return state.repositories.find(r => r.root === activeRepo) ?? state.repositories[0];
-}
-
-function hideContextMenu() {
-    contextMenu.classList.add('hidden');
-    contextTarget = null;
-}
-
-function showRollbackMenu(event, repo, files) {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!files?.length) return;
-
-    contextTarget = { repo, files };
-    contextMenu.classList.remove('hidden');
-
-    const margin = 6;
-    const rect = contextMenu.getBoundingClientRect();
-    const left = Math.min(event.clientX, window.innerWidth - rect.width - margin);
-    const top = Math.min(event.clientY, window.innerHeight - rect.height - margin);
-    contextMenu.style.left = Math.max(margin, left) + 'px';
-    contextMenu.style.top = Math.max(margin, top) + 'px';
-}
-
-function initializeSelection(repo) {
-    const visible = new Set([...(repo.tracked || []), ...(repo.untracked || [])].map(file => file.file));
-    let selected = selectedFiles.get(repo.root);
-    if (!initializedRepos.has(repo.root)) {
-        selected = new Set((repo.stagedFiles || []).filter(file => visible.has(file)));
-        selectedFiles.set(repo.root, selected);
-        initializedRepos.add(repo.root);
-    } else {
-        for (const file of [...selected]) if (!visible.has(file)) selected.delete(file);
-    }
-}
-
-function selectedForRepo(repoRoot) {
-    return [...(selectedFiles.get(repoRoot) || new Set())];
-}
-
-function isSelected(repoRoot, file) {
-    return selectedFiles.get(repoRoot)?.has(file) || false;
-}
-
-function setSelected(repoRoot, files, checked) {
-    let selected = selectedFiles.get(repoRoot);
-    if (!selected) {
-        selected = new Set();
-        selectedFiles.set(repoRoot, selected);
-    }
-    for (const file of files) checked ? selected.add(file) : selected.delete(file);
-}
-
-function selectionAttrs(repoRoot, files) {
-    const selectedCount = files.filter(file => isSelected(repoRoot, file)).length;
-    return selectedCount === files.length && files.length ? 'checked ' : '';
-}
-
-function syncVisibleChecks(repoRoot) {
-    document.querySelectorAll('.file-check').forEach(input => {
-        if (input.dataset.repo === repoRoot) input.checked = isSelected(repoRoot, input.dataset.file);
-    });
-    updateParentChecks(repoRoot);
-}
-
-function updateParentChecks(repoRoot) {
-    document.querySelectorAll('.group-check, .folder-check').forEach(input => {
-        if (input.dataset.repo !== repoRoot) return;
-        const files = JSON.parse(input.dataset.files || '[]');
-        const selectedCount = files.filter(file => isSelected(repoRoot, file)).length;
-        input.checked = files.length > 0 && selectedCount === files.length;
-        input.indeterminate = selectedCount > 0 && selectedCount < files.length;
-    });
-}
-
-function render() {
-    document.documentElement.style.setProperty('--list-item-spacing', (state.listItemSpacing ?? 2) + 'px');
-    changesTab.classList.toggle('active', activeTab === 'changes');
-    stashesTab.classList.toggle('active', activeTab === 'stashes');
-    commitArea.style.display = activeTab === 'changes' ? '' : 'none';
-
-    if (!state.repositories.length) {
-        repos.innerHTML = '<div class="empty">No Git repository found in this workspace.</div>';
-        commit.disabled = true;
-        commitPush.disabled = true;
-        generateCommitMessage.disabled = true;
-        generateCommitMessage.style.display = state.aiEnabled ? '' : 'none';
-        return;
-    }
-
-    commit.disabled = false;
-    commitPush.disabled = false;
-    generateCommitMessage.style.display = state.aiEnabled ? '' : 'none';
-    generateCommitMessage.disabled = !state.aiEnabled;
-
-    repos.innerHTML = activeTab === 'changes'
-      ? state.repositories.map(renderChangesRepository).join('')
-      : state.repositories.map(renderStashRepository).join('');
-
-    document.querySelectorAll('.repo').forEach(el => {
-        el.addEventListener('mousedown', () => activeRepo = el.dataset.repo || '');
-    });
-
-    if (activeTab === 'stashes') {
-        bindStashEvents();
-        return;
-    }
-
-    bindChangeEvents();
-}
-
-function renderChangesRepository(repo) {
-    const branchInfo = repo.branch +
-        (repo.ahead ? ' ↑' + repo.ahead : '') +
-        (repo.behind ? ' ↓' + repo.behind : '');
-    initializeSelection(repo);
-    const tracked = renderGroup(repo, 'Tracked', repo.tracked);
-    const untracked = renderGroup(repo, 'Untracked', repo.untracked);
-
-    return '<section class="repo" data-repo="' + esc(repo.root) + '">' +
-        '<div class="repo-header"><span class="repo-title">' + esc(repo.name) + '</span>' +
-        '<div class="branch-wrap"><span class="branch" title="Branch actions" data-repo="' + esc(repo.root) + '">' + esc(branchInfo) + ' ▾</span>' +
-        renderBranchMenu(repo) + '</div></div>' +
-        tracked + untracked +
-        '</section>';
-}
-
-function renderStashRepository(repo) {
-    const stashes = repo.stashes || [];
-    const stashHtml = stashes.length
-      ? stashes.map(stash => renderStash(repo, stash)).join('')
-      : '<div class="empty">No stashes in this repository.</div>';
-
-    return '<section class="repo" data-repo="' + esc(repo.root) + '">' +
-      '<div class="repo-header"><span class="repo-title">' + esc(repo.name) + '</span>' +
-      '<span class="stash-ref">' + stashes.length + ' stash' + (stashes.length === 1 ? '' : 'es') + '</span></div>' +
-      '<div class="stash-create">' +
-        '<div class="stash-create-row">' +
-          '<input class="stash-message" data-repo="' + esc(repo.root) + '" placeholder="Stash message (optional)">' +
-          '<button class="stash-create-button primary" data-repo="' + esc(repo.root) + '">Stash</button>' +
-        '</div>' +
-        '<div class="stash-options"><label><input class="stash-untracked" data-repo="' + esc(repo.root) + '" type="checkbox"> Include untracked files</label></div>' +
-      '</div>' + stashHtml + '</section>';
-}
-
-function renderStash(repo, stash) {
-    const date = stash.timestamp ? new Date(stash.timestamp * 1000).toLocaleString() : '';
-    const files = stash.files || [];
-    const fileRows = files.length ? files.map(file =>
-      '<div class="stash-file" data-repo="' + esc(repo.root) + '" data-ref="' + esc(stash.ref) + '" data-file="' + esc(file.path) + '" data-untracked="' + (file.untracked ? 'true' : 'false') + '" title="Open stash diff">' +
-        '<span class="stash-status">' + esc(file.status) + '</span>' +
-        '<span class="stash-file-name">' + esc(file.name) + '</span>' +
-        (file.dir ? '<span class="stash-file-dir">' + esc(file.dir) + '</span>' : '') +
-      '</div>'
-    ).join('') : '<div class="empty">No changed files.</div>';
-
-    return '<details class="stash-card">' +
-      '<summary class="stash-summary">' +
-        '<span class="stash-title">' + esc(stash.message || stash.ref) + '</span>' +
-        '<span class="stash-meta">' + files.length + ' file' + (files.length === 1 ? '' : 's') + '</span>' +
-        '<span class="stash-ref">' + esc(stash.ref) + '</span>' +
-      '</summary>' +
-      '<div class="stash-files">' + fileRows + '</div>' +
-      '<div class="stash-actions">' +
-        '<button class="stash-action" data-action="apply" data-repo="' + esc(repo.root) + '" data-ref="' + esc(stash.ref) + '">Apply</button>' +
-        '<button class="stash-action" data-action="pop" data-repo="' + esc(repo.root) + '" data-ref="' + esc(stash.ref) + '">Pop</button>' +
-        '<button class="stash-action" data-action="drop" data-repo="' + esc(repo.root) + '" data-ref="' + esc(stash.ref) + '">Drop</button>' +
-        '<span class="stash-meta" style="margin-left:auto;align-self:center">' + esc(date) + '</span>' +
-      '</div>' +
-    '</details>';
-}
-
-function bindStashEvents() {
-    document.querySelectorAll('.stash-create-button').forEach(button => {
-        button.addEventListener('click', () => createStash(button.dataset.repo));
-    });
-    document.querySelectorAll('.stash-message').forEach(input => {
-        input.addEventListener('keydown', event => {
-            if (event.key === 'Enter') {
-                event.preventDefault();
-                createStash(input.dataset.repo);
-            }
-        });
-    });
-    document.querySelectorAll('.stash-action').forEach(button => {
-        button.addEventListener('click', event => {
-            event.preventDefault();
-            event.stopPropagation();
-            vscode.postMessage({
-                type: 'stashAction',
-                repo: button.dataset.repo,
-                action: button.dataset.action,
-                ref: button.dataset.ref
-            });
-        });
-    });
-    document.querySelectorAll('.stash-file').forEach(file => {
-        file.addEventListener('dblclick', event => {
-            event.preventDefault();
-            vscode.postMessage({
-                type: 'stashDiff',
-                repo: file.dataset.repo,
-                ref: file.dataset.ref,
-                file: file.dataset.file,
-                untracked: file.dataset.untracked === 'true'
-            });
-        });
-    });
-}
-
-function createStash(repo) {
-    const section = document.querySelector('.repo[data-repo="' + CSS.escape(repo) + '"]');
-    if (!section) return;
-    const input = section.querySelector('.stash-message');
-    const untracked = section.querySelector('.stash-untracked');
-    vscode.postMessage({
-        type: 'createStash',
-        repo,
-        message: input?.value || '',
-        includeUntracked: !!untracked?.checked
-    });
-}
-
-function bindChangeEvents() {
-    document.querySelectorAll('.file-row').forEach(el => {
-        el.addEventListener('contextmenu', event => {
-            const file = el.querySelector('.file-main');
-            if (!file) return;
-            showRollbackMenu(event, file.dataset.repo, [file.dataset.file]);
-        });
-    });
-
-    document.querySelectorAll('.tree-folder > summary').forEach(el => {
-        el.addEventListener('contextmenu', event => {
-            const input = el.querySelector('.folder-check');
-            if (!input) return;
-            const files = JSON.parse(input.dataset.files || '[]');
-            showRollbackMenu(event, input.dataset.repo, files);
-        });
-    });
-
-    document.querySelectorAll('.branch').forEach(el => {
-        el.addEventListener('click', event => {
-            event.stopPropagation();
-            const trigger = event.currentTarget;
-            const menu = trigger.parentElement.querySelector('.branch-menu');
-            document.querySelectorAll('.branch-menu').forEach(other => {
-                if (other !== menu) other.classList.add('hidden');
-            });
-            menu.classList.toggle('hidden');
-        });
-    });
-
-    document.querySelectorAll('.branch-entry[data-submenu], .remote-entry[data-submenu]').forEach(el => {
-        el.addEventListener('click', event => {
-            event.stopPropagation();
-            const entry = event.currentTarget;
-            const submenu = entry.querySelector(':scope > .branch-submenu, :scope > .remote-submenu');
-            if (submenu) submenu.classList.add('open');
-        });
-    });
-
-    document.querySelectorAll('.menu-header').forEach(el => {
-        el.addEventListener('click', event => {
-            event.stopPropagation();
-            event.currentTarget.parentElement.classList.remove('open');
-        });
-    });
-
-    document.querySelectorAll('.push-entry[data-push-default]').forEach(el => {
-        el.addEventListener('click', event => {
-            event.stopPropagation();
-            const push = event.currentTarget;
-            document.querySelectorAll('.branch-menu').forEach(menu => menu.classList.add('hidden'));
-            vscode.postMessage({ type: 'branchAction', repo: push.dataset.repo, action: 'push', remote: push.dataset.remote || undefined });
-        });
-    });
-
-    document.querySelectorAll('.branch-action[data-action]').forEach(el => {
-        el.addEventListener('click', event => {
-            event.stopPropagation();
-            const action = event.currentTarget;
-            if (action.classList.contains('disabled')) return;
-            document.querySelectorAll('.branch-menu').forEach(menu => menu.classList.add('hidden'));
-            vscode.postMessage({
-                type: 'branchAction', repo: action.dataset.repo, action: action.dataset.action,
-                branch: action.dataset.branch || undefined, remote: action.dataset.remote || undefined,
-                remoteBranch: action.dataset.remoteBranch || undefined
-            });
-        });
-    });
-
-    document.querySelectorAll('.file-check').forEach(el => {
-        el.addEventListener('change', event => {
-            const input = event.currentTarget;
-            setSelected(input.dataset.repo, [input.dataset.file], input.checked);
-            updateParentChecks(input.dataset.repo);
-        });
-    });
-
-    document.querySelectorAll('.folder-check').forEach(el => el.addEventListener('click', event => event.stopPropagation()));
-    document.querySelectorAll('.group-check, .folder-check').forEach(el => {
-        el.addEventListener('change', event => {
-            const input = event.currentTarget;
-            const files = JSON.parse(input.dataset.files || '[]');
-            setSelected(input.dataset.repo, files, input.checked);
-            syncVisibleChecks(input.dataset.repo);
-        });
-    });
-
-    document.querySelectorAll('.file-main').forEach(el => {
-        el.addEventListener('dblclick', event => {
-            event.stopPropagation();
-            const row = event.currentTarget;
-            vscode.postMessage({
-                type: 'diff', repo: row.dataset.repo, file: row.dataset.file,
-                staged: row.dataset.staged === 'true', status: Number(row.dataset.status)
-            });
-        });
-    });
-}
-
-function renderBranchMenu(repo) {
-    const branchItems = (repo.branches || []).map(branch => {
-        const current = branch === repo.branch;
-        const branchAttr = esc(branch);
-        return '<div class="branch-entry' + (current ? ' current' : '') + '" data-submenu="true">' +
-          '<span class="branch-check">' + (current ? '✓' : '') + '</span>' +
-          '<span>' + esc(branch) + '</span>' +
-          '<span class="branch-entry-arrow">›</span>' +
-          '<div class="branch-submenu">' +
-            '<div class="menu-header">‹ ' + esc(branch) + '</div>' +
-            '<div class="branch-action' + (current ? ' disabled' : '') + '" data-action="checkout" data-repo="' + esc(repo.root) + '" data-branch="' + branchAttr + '">Checkout</div>' +
-            (!current ? '<div class="branch-action" data-action="merge" data-repo="' + esc(repo.root) + '" data-branch="' + branchAttr + '">Merge into current branch</div>' : '') +
-            '<div class="branch-action" data-action="createFrom" data-repo="' + esc(repo.root) + '" data-branch="' + branchAttr + '">New Branch from Here…</div>' +
-            '<div class="branch-action' + (current ? ' disabled' : '') + '" data-action="delete" data-repo="' + esc(repo.root) + '" data-branch="' + branchAttr + '">Delete</div>' +
-          '</div>' +
-        '</div>';
-    }).join('');
-
-    const remoteItems = (repo.remotes || []).map(remote => {
-        const remoteBranches = (remote.branches || []).map(branch => {
-            const ref = remote.name + '/' + branch;
-            return '<div class="branch-entry remote-branch-entry" data-submenu="true">' +
-              '<span class="branch-check"></span>' +
-              '<span>' + esc(branch) + '</span>' +
-              '<span class="branch-entry-arrow">›</span>' +
-              '<div class="branch-submenu">' +
-                '<div class="menu-header">‹ ' + esc(branch) + '</div>' +
-                '<div class="branch-action" data-action="checkoutRemote" data-repo="' + esc(repo.root) + '" data-remote="' + esc(remote.name) + '" data-remote-branch="' + esc(branch) + '">Checkout</div>' +
-                (branch !== repo.branch ? '<div class="branch-action" data-action="merge" data-repo="' + esc(repo.root) + '" data-branch="' + esc(ref) + '">Merge into current branch</div>' : '') +
-                '<div class="branch-action" data-action="createFrom" data-repo="' + esc(repo.root) + '" data-branch="' + esc(ref) + '">New Branch from Here…</div>' +
-                '<div class="branch-action" data-action="deleteRemote" data-repo="' + esc(repo.root) + '" data-remote="' + esc(remote.name) + '" data-remote-branch="' + esc(branch) + '">Delete</div>' +
-              '</div>' +
-            '</div>';
-        }).join('');
-
-        return '<div class="remote-entry" data-submenu="true">' +
-          '<span class="branch-check"></span>' +
-          '<span>' + esc(remote.name) + '</span>' +
-          '<span class="branch-entry-arrow">›</span>' +
-          '<div class="remote-submenu">' +
-            '<div class="menu-header">‹ ' + esc(remote.name) + '</div>' + remoteBranches +
-          '</div>' +
-        '</div>';
-    }).join('');
-
-    const pushRemotes = (repo.remotes || []).map(remote =>
-        '<div class="branch-action" data-action="push" data-repo="' + esc(repo.root) + '" data-remote="' + esc(remote.name) + '">' + esc(remote.name) + '</div>'
-    ).join('');
-    const firstRemote = (repo.remotes || [])[0]?.name;
-    const pushItem = firstRemote
-      ? ((repo.remotes || []).length > 1
-          ? '<div class="branch-entry push-entry" data-submenu="true">' +
-              '<span class="branch-check"></span><span>Push</span>' +
-              '<span class="branch-entry-arrow">›</span>' +
-              '<div class="branch-submenu"><div class="menu-header">‹ Push</div>' + pushRemotes + '</div>' +
-            '</div>'
-          : '<div class="branch-action" data-action="push" data-repo="' + esc(repo.root) + '" data-remote="' + esc(firstRemote) + '">Push</div>')
-      : '<div class="branch-action disabled">Push</div>';
-
-    return '<div class="branch-menu hidden">' +
-      branchItems +
-      (remoteItems ? '<div class="branch-menu-separator"></div>' + remoteItems : '') +
-      '<div class="branch-menu-separator"></div>' +
-      '<div class="branch-action" data-action="create" data-repo="' + esc(repo.root) + '">Create Branch…</div>' +
-      '<div class="branch-menu-separator"></div>' +
-      pushItem +
-      '</div>';
-}
-
-function renderGroup(repo, title, files) {
-    if (!files.length) return '';
-    const mode = state.viewMode || 'flat';
-    const content = mode === 'tree'
-      ? renderTree(repo, files)
-      : files.map(file => renderFileRow(repo, file, false)).join('');
-    const filesJson = esc(JSON.stringify(files.map(file => file.file)));
-
-    return '<div class="group">' +
-      '<div class="group-title">' +
-      '<input class="group-check" type="checkbox" ' + selectionAttrs(repo.root, files.map(file => file.file)) +
-        'title="Select group"' +
-        'data-repo="' + esc(repo.root) + '" data-files="' + filesJson + '">' +
-      title + '<span class="count">' + files.length + '</span>' +
-      '</div>' +
-      content +
-      '</div>';
-}
-
-function gitStatusClass(status) {
-    switch (status) {
-        case 0:  // INDEX_MODIFIED
-        case 5:  // MODIFIED
-        case 12: // TYPE_CHANGED
-            return 'git-modified';
-
-        case 1:  // INDEX_ADDED
-        case 7:  // UNTRACKED
-        case 9:  // INTENT_TO_ADD
-            return 'git-added';
-
-        case 2:  // INDEX_DELETED
-        case 6:  // DELETED
-        case 15: // DELETED_BY_US
-        case 16: // DELETED_BY_THEM
-        case 18: // BOTH_DELETED
-            return 'git-deleted';
-
-        case 3:  // INDEX_RENAMED
-        case 4:  // INDEX_COPIED
-        case 10: // INTENT_TO_RENAME
-            return 'git-renamed';
-
-        case 13: // ADDED_BY_US
-        case 14: // ADDED_BY_THEM
-        case 17: // BOTH_ADDED
-        case 19: // BOTH_MODIFIED
-            return 'git-conflict';
-
-        case 8:  // IGNORED
-            return 'git-ignored';
-
-        default:
-            return '';
-    }
-}
-
-function themeIconHtml(icon, extraClass) {
-    if (!icon) return '';
-    const classes = 'node-icon' + (extraClass ? ' ' + extraClass : '');
-    if (icon.kind === 'image') {
-        return '<span class="' + classes + '" aria-hidden="true"><img src="' + esc(icon.uri) + '"></span>';
-    }
-    if (icon.kind === 'font') {
-        const style = [
-            'font-family:' + JSON.stringify(icon.fontFamily),
-            icon.color ? 'color:' + icon.color : '',
-            icon.fontSize ? 'font-size:' + icon.fontSize : ''
-        ].filter(Boolean).join(';');
-        return '<span class="' + classes + ' node-icon-font" aria-hidden="true" style="' + esc(style) + '">' + esc(icon.character) + '</span>';
-    }
-    return '';
-}
-
-function fileThemeIcon(file) {
-    return themeIconHtml(file.icon, 'file-theme-icon');
-}
-
-function folderThemeIcons(name) {
-    const theme = state.fileIconTheme || {};
-    const pair = (theme.folders && theme.folders[String(name || '').toLowerCase()]) || theme.defaultFolder || {};
-    const open = themeIconHtml(pair.open || pair.closed, 'folder-icon-open');
-    const closed = themeIconHtml(pair.closed || pair.open, 'folder-icon-closed');
-    return open + closed;
-}
-
-function renderFileRow(repo, file, treeFile) {
-    const statusClass = gitStatusClass(file.status);
-    return '<div class="file-row' + (treeFile ? ' tree-file' : '') + (statusClass ? ' ' + statusClass : '') + '" title="' + esc(file.tooltip) + '">' +
-      '<input class="file-check" type="checkbox" ' + (isSelected(repo.root, file.file) ? 'checked ' : '') +
-        'data-repo="' + esc(repo.root) + '" data-file="' + esc(file.file) + '">' +
-      fileThemeIcon(file) +
-      '<div class="file-main" data-repo="' + esc(repo.root) + '" data-file="' + esc(file.file) + '" data-staged="' + (file.stagedOnly ? 'true' : 'false') + '" data-status="' + file.status + '">' +
-        '<span class="file-name">' + esc(file.name) + '</span>' +
-        (!treeFile && file.dir ? '<span class="file-dir">' + esc(file.dir) + '</span>' : '') +
-      '</div></div>';
-}
-
-function renderTree(repo, files) {
-    const root = { dirs: new Map(), files: [] };
-
-    for (const file of files) {
-        const parts = Array.isArray(file.dirParts)
-          ? file.dirParts
-          : (file.dir ? file.dir.split(String.fromCharCode(92)).join('/').split('/').filter(Boolean) : []);
-        let node = root;
-        for (const part of parts) {
-            if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [] });
-            node = node.dirs.get(part);
-        }
-        node.files.push(file);
-    }
-
-    function descendantFiles(node) {
-        return [
-            ...node.files.map(file => file.file),
-            ...[...node.dirs.values()].flatMap(child => descendantFiles(child))
-        ];
-    }
-
-    function nodeHtml(node) {
-        const dirs = [...node.dirs.entries()]
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([name, child]) => {
-            const filesJson = esc(JSON.stringify(descendantFiles(child)));
-            return '<details class="tree-folder" open>' +
-              '<summary>' +
-                '<input class="folder-check" type="checkbox" ' + selectionAttrs(repo.root, descendantFiles(child)) +
-                  'title="Select folder"' +
-                  'data-repo="' + esc(repo.root) + '" data-files="' + filesJson + '">' +
-                folderThemeIcons(name) +
-                '<span>' + esc(name) + '</span>' +
-              '</summary>' +
-              '<div class="tree-children">' + nodeHtml(child) + '</div>' +
-            '</details>';
-          }).join('');
-
-        const rows = node.files
-          .slice()
-          .sort((a, b) => a.name.localeCompare(b.name))
-          .map(file => renderFileRow(repo, file, true))
-          .join('');
-
-        return dirs + rows;
-    }
-
-    return '<div class="tree-root">' + nodeHtml(root) + '</div>';
-}
-
-function doCommit(push) {
-    const repo = repoForCommit();
-    if (!repo) return;
-    vscode.postMessage({
-        type: push ? 'commitPush' : 'commit',
-        repo: repo.root,
-        message: message.value,
-        files: selectedForRepo(repo.root)
-    });
-}
-
-generateCommitMessage.addEventListener('click', () => {
-    const repo = repoForCommit();
-    if (!repo || generateCommitMessage.disabled) return;
-
-    vscode.postMessage({
-        type: 'generateCommitMessage',
-        repo: repo.root,
-        files: selectedForRepo(repo.root)
-    });
-});
-
-commit.addEventListener('click', () => doCommit(false));
-commitPush.addEventListener('click', () => doCommit(true));
-
-rollbackContext.addEventListener('click', event => {
-    event.stopPropagation();
-    if (!contextTarget) return;
-    const target = contextTarget;
-    hideContextMenu();
-    vscode.postMessage({ type: 'rollback', repo: target.repo, files: target.files });
-});
-
-message.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && e.ctrlKey) {
-        e.preventDefault();
-        doCommit(false);
-    }
-});
-
-document.addEventListener('click', () => {
-    document.querySelectorAll('.branch-menu').forEach(menu => menu.classList.add('hidden'));
-    hideContextMenu();
-});
-
-document.addEventListener('keydown', event => {
-    if (event.key === 'Escape') {
-        document.querySelectorAll('.branch-menu').forEach(menu => menu.classList.add('hidden'));
-        hideContextMenu();
-    }
-});
-
-window.addEventListener('message', event => {
-    const data = event.data;
-    if (data.type === 'state') {
-        debug('State received. repositories=' + (data.repositories?.length ?? 0) + ', viewMode=' + data.viewMode);
-        state = data;
-        const iconFontStyle = document.getElementById('file-icon-theme-fonts');
-        if (iconFontStyle) iconFontStyle.textContent = state.fileIconTheme?.css || '';
-        if (!activeRepo && state.repositories.length) activeRepo = state.repositories[0].root;
-        render();
-    } else if (data.type === 'fatalError') {
-        repos.innerHTML = '<div class="empty">AOH - Git failed to load. Check Output → AOH - Git.</div>';
-        debug('Backend fatal error: ' + data.message);
-    } else if (data.type === 'commitMessageGeneration') {
-        const applies = activeRepo === data.repo || state.repositories.length === 1;
-        if (applies) {
-            generateCommitMessage.disabled = !!data.running;
-            generateCommitMessage.classList.toggle('generating', !!data.running);
-            generateCommitMessage.textContent = data.running ? '✧' : '✦';
-            generateCommitMessage.title = data.running
-                ? 'AI is generating a commit message…'
-                : 'Generate commit message with AI';
-        }
-    } else if (data.type === 'generatedCommitMessage') {
-        if (activeRepo === data.repo || state.repositories.length === 1) {
-            message.value = data.message || '';
-            message.focus();
-            message.setSelectionRange(message.value.length, message.value.length);
-        }
-    } else if (data.type === 'committed') {
-        if (activeRepo === data.repo || state.repositories.length === 1) {
-            message.value = '';
-        }
-    }
-});
-
-changesTab.addEventListener('click', () => { activeTab = 'changes'; render(); });
-stashesTab.addEventListener('click', () => { activeTab = 'stashes'; render(); });
-
-vscode.postMessage({ type: 'ready' });
-</script>
-</body>
-</html>`;
-    }
-}
-
-function getNonce(): string {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    let value = '';
-    for (let i = 0; i < 32; i++) {
-        value += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return value;
 }
 
 export function deactivate() {}
