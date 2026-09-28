@@ -27,6 +27,10 @@ It provides a dedicated Git view with repository state, branch operations, stagi
 - Output channel for diagnostics
 - Optional AI-generated commit messages through an external CLI
 
+## Reuse Commit Messages
+
+The **clock icon** inside the commit message box, next to the AI button (tooltip: **Recent Commit Messages**) opens a searchable list of the latest 100 commits in the active repository’s current history. Select an entry to replace the editor contents with its full message, including the body. You can edit it before committing. Cancelling keeps your current draft.
+
 ## AI Commit Messages
 
 AI support is optional and disabled by default. AOH - Git does not depend on a specific AI provider. Instead, it can execute a configurable command-line tool and use its standard output as the generated commit message.
@@ -57,6 +61,19 @@ Generation uses the selected files, including new files before the first commit.
 Stash file lists and counts are loaded when a stash is expanded and cached until that stash disappears. Refreshes preserve folder/stash expansion, scroll position, and stash message drafts. Unchanged repository sections are reused.
 
 A successful commit clears the commit message even if a subsequent push fails. Use Push to retry the upload.
+
+## Context Menus
+
+Right-click a changed file or a folder in the Changes view to open the file actions and the **Git** submenu. You can also focus a row and press Shift+F10 or the context-menu key. Use arrow keys to navigate, Right/Left to enter/leave Git, and Escape to close. Long menus scroll inside the view.
+
+- Right-clicking a checked file uses the checked files in that repository; right-clicking an unchecked file uses that file. A folder uses its listed changed descendants. Delete removes those changed files, not the whole folder.
+- **Add to VCS** appears only for an entirely untracked selection. **Create Patch from Local Changes** and the root **Stash Changes** appear only for an entirely tracked selection. The Git submenu also permits staging and stashing untracked files.
+- **Commit Files** selects the context files and focuses the commit message. **Unstash Changes** opens the Stashes tab for the selected repository.
+- **Copy Relative Path** copies paths relative to the repository root. Folder path commands copy the folder path. **Add to .gitignore** appends exact paths to the root ignore file; already tracked files remain tracked.
+- Diff/source/history/comparison actions offer a file picker when several files are selected. Comparisons use the chosen revision against the current working file; history offers the latest 100 commits for that file.
+- Patch export includes selected working-tree changes and supports binary files. It uses a temporary index and preserves existing staging.
+- Context-menu stashes include only selected changes, preserving unrelated staging and the selected staged/unstaged split. Stashing requires an initial commit; stashing a selection consisting entirely of staged deletions requires Git 2.35 or later.
+- Push, pull, fetch, branches, merge, rebase, tags, reset, and remotes act on the context repository. New tags are local and point at HEAD. Reset explicitly offers Soft, Mixed, and Hard; its scope is the whole repository. Destructive actions ask for confirmation, and unresolved conflicts are left for you to resolve.
 
 ## Rollback
 

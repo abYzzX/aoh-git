@@ -2,6 +2,16 @@
 
 All notable changes to AOH - Git will be documented in this file.
 
+## 0.1.3
+
+- Reuse a complete previous commit message through a compact clock-icon button inside the commit message box, next to the AI button.
+- Add file/folder context menus with a Git submenu, tracked/untracked visibility rules, keyboard navigation, and scrolling for smaller views.
+- Add source/diff navigation, revision and branch/tag comparisons, file history, path copying, deletion, staging, and exact-path .gitignore entries.
+- Export selected local changes as a patch file or clipboard patch, including binary files, without changing the Git index.
+- Stash only selected changes while preserving unrelated staging; expose merge, rebase, local tag creation, reset modes, remote management, and clone actions.
+- Branch selection now includes remote branches.
+- Commit Files opens the commit editor with the context selection; Unstash Changes opens the existing Stashes tab.
+
 ## 0.1.2
 
 - Terminate AI wrapper subprocesses and their descendants on timeout or excessive output before allowing another generation.

@@ -37,9 +37,23 @@ The main Changes/Stashes interface is implemented as a VS Code webview. Extensio
 
 `StashStore` reads only stash metadata during normal refreshes. File lists load on expansion, use NUL-delimited Git output, and are cached by repository and immutable stash hash. Caches are pruned when stashes or repositories disappear; diff inspection uses hashes so stash renumbering cannot redirect an open diff.
 
+### Context menus
+
+`contextMenu.ts` defines the root/Git menus and visibility restrictions. The webview shares the same definitions; selection type is determined from all target files. Menus are scrollable, constrained to the viewport, and support keyboard navigation. The Git submenu is a separate fixed overlay so it is not clipped by the root menu's scrolling container.
+
+`ContextActions` owns host dialogs and routes file/repository operations. The host validates paths against current repository changes and prevents concurrent context actions/commits within a repository. Existing rollback, branch, push, and diff workflows are reused. Public Git API methods supply staging, history, merging, tagging, and remote operations; CLI calls cover revision resolution, rebase, reset, patch creation, selected-file stashes, and remote URL editing. `git.clone` delegates to VS Code's clone workflow.
+
+`contextGit.ts` isolates path handling, literal Git pathspecs, ignore-pattern escaping, patch export, and selected-file stashing for integration tests. Patch export snapshots selected working contents through an alternate index. Selected stashes seed an alternate index with only the selected staged changes because ordinary Git path-limited stashes also include unrelated staged changes. Explicit pathspecs for staged deletions are omitted from `stash push`; those deletions remain in the alternate index and are restored after stashing. A deletion-only selection uses `stash push --staged` (Git 2.35+). The real index/worktree is cleaned only for selected tracked paths after the stash is saved. Temporary files are removed in `finally` blocks.
+
+Root tracked/untracked restrictions apply only to homogeneous selections. Rename sources accompany selected destinations in patches/stashes. Operations do not implicitly untrack ignored files or resolve conflicts. Reset modes explicitly describe their repository-wide effects and require confirmation.
+
 ### File icon themes
 
 `FileIconThemeService` reads the active contributed VS Code file icon theme and resolves its file/folder mappings, resources, and icon fonts for use in the webview. Theme changes cause icon data to be reloaded.
+
+### Previous commit messages
+
+The button inside the commit message box, next to the AI button loads up to 100 messages on demand through the built-in Git API’s `Repository.log`. A native Quick Pick shows subjects, hashes, and body previews; selection transfers the original full message to the webview. The request is bound to its repository, and a result is applied only if that repository is still active. Empty history and cancellation leave the draft unchanged. No status refresh or Git mutation is required.
 
 ### AI commit messages
 
@@ -71,4 +85,4 @@ The repository contains the extension source and package metadata, but intention
 
 ## Planned work
 
-Planned work should remain in issues rather than being treated as implemented behavior. Current known candidates include richer Git context-menu integration and improving prune behavior so stale local branches can be cleaned up only when they are safely merged.
+Planned work should remain in issues rather than being treated as implemented behavior. Current known candidates include improving prune behavior so stale local branches can be cleaned up only when they are safely merged.

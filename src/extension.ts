@@ -7,6 +7,9 @@ import { FileIconThemeService } from './fileIconThemeService';
 import { Status, Change, Repository, GitAPI, GitExtension } from './gitApi';
 import { parseLocalBranches, parseRemoteBranches, splitRemoteBranch } from './gitOutput';
 import { renderWebview } from './webview';
+import { ContextActions } from './contextActions';
+import { ContextAction, isContextAction } from './contextMenu';
+import { relativePaths } from './contextGit';
 import { RefreshQueue } from './refreshQueue';
 import { StashStore } from './stashStore';
 import { runAi } from './ai';
@@ -17,6 +20,8 @@ const execFileAsync = promisify(execFile);
 
 type WebMessage =
     | { type: 'ready' }
+    | { type: 'selectCommitMessage'; repo: string }
+    | { type: 'contextAction'; action: ContextAction; repo: string; files: string[]; folder?: string }
     | { type: 'open'; repo: string; file: string }
     | { type: 'diff'; repo: string; file: string; staged: boolean; status: Status }
     | { type: 'commit'; repo: string; message: string; files: string[] }
@@ -79,6 +84,14 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
     private readonly loadingStashes = new Set<string>();
     private readonly generatingRepos = new Set<string>();
     private readonly committingRepos = new Set<string>();
+    private readonly contextOperations = new Set<string>();
+    private readonly contextActions = new ContextActions(() => this.api, {
+        rollback: (repo, files) => this.rollback(repo, files),
+        branch: (root, action) => this.handleBranchAction(root, action),
+        branches: root => this.selectBranch(root),
+        diff: (repo, file) => this.openContextDiff(repo, file)
+    });
+    private selectingCommitMessage = false;
     private lastState = '';
     private readonly fileIconTheme: FileIconThemeService;
 
@@ -415,12 +428,25 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
 
         const repo = this.repository(message.repo);
         if (!repo) {
+            if (message.type === 'selectCommitMessage') this.view?.webview.postMessage({ type: 'commitMessageHistoryFinished' });
             vscode.window.showErrorMessage('AOH - Git: repository is no longer available.');
             return;
         }
 
         try {
             switch (message.type) {
+                case 'selectCommitMessage':
+                    if (this.selectingCommitMessage) return;
+                    this.selectingCommitMessage = true;
+                    try { await this.selectCommitMessage(repo); }
+                    finally {
+                        this.selectingCommitMessage = false;
+                        this.view?.webview.postMessage({ type: 'commitMessageHistoryFinished' });
+                    }
+                    return;
+                case 'contextAction':
+                    await this.handleContextAction(repo, message);
+                    return;
                 case 'loadStash': {
                     const key = JSON.stringify([message.repo, message.hash]);
                     if (this.loadingStashes.has(key)) return;
@@ -480,7 +506,10 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                     return;
                 case 'commit':
                 case 'commitPush':
-                    if (this.committingRepos.has(message.repo)) return;
+                    if (this.committingRepos.has(message.repo) || this.contextOperations.has(message.repo)) {
+                        this.view?.webview.postMessage({ type: 'commitFinished', repo: message.repo });
+                        return;
+                    }
                     this.committingRepos.add(message.repo);
                     try {
                         await this.commit(repo, message.message, message.type === 'commitPush', message.files);
@@ -497,6 +526,80 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         } catch (err) {
             const text = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(`AOH - Git: ${text}`);
+        }
+    }
+
+    private async selectCommitMessage(repo: Repository): Promise<void> {
+        const commits = repo.state.HEAD?.commit ? await repo.log({ maxEntries: 100 }) : [];
+        if (!commits.length) {
+            await vscode.window.showInformationMessage('This repository has no previous commit messages.');
+            return;
+        }
+        const picked = await vscode.window.showQuickPick(commits.map(commit => {
+            const [subject, ...body] = commit.message.split(/\r?\n/);
+            return {
+                label: subject || '(Empty commit message)',
+                description: commit.hash.slice(0, 10),
+                detail: body.join(' ').trim() || undefined,
+                message: commit.message
+            };
+        }), {
+            title: `Recent Commit Messages — ${path.basename(repo.rootUri.fsPath)}`,
+            placeHolder: 'Select a message to reuse (latest 100 commits)',
+            matchOnDescription: true,
+            matchOnDetail: true
+        });
+        if (picked) this.view?.webview.postMessage({
+            type: 'commitMessageSelected', repo: repo.rootUri.fsPath, message: picked.message
+        });
+    }
+
+    private async handleContextAction(repo: Repository, message: Extract<WebMessage, { type: 'contextAction' }>): Promise<void> {
+        if (!isContextAction(message.action)) throw new Error('This menu action is not available.');
+        if (!Array.isArray(message.files) || !message.files.every(file => typeof file === 'string')) throw new Error('Invalid file selection.');
+        const root = repo.rootUri.fsPath;
+        if (this.contextOperations.has(root) || this.committingRepos.has(root)) {
+            vscode.window.showInformationMessage('Wait for the current repository operation to finish.');
+            return;
+        }
+        const files = [...new Set(message.files)];
+        relativePaths(root, files);
+        if (message.folder !== undefined) {
+            if (typeof message.folder !== 'string') throw new Error('Invalid folder selection.');
+            relativePaths(root, [path.resolve(root, message.folder)]);
+        }
+        this.contextOperations.add(root);
+        const mutates = new Set<ContextAction>(['add', 'rollback', 'delete', 'ignore', 'stash', 'push', 'pull', 'fetch',
+            'merge', 'rebase', 'branches', 'newBranch', 'newTag', 'reset', 'remotes']);
+        try {
+            // Refresh before validating paths from a potentially stale webview snapshot.
+            if (mutates.has(message.action)) await repo.status();
+            const known = new Set([...repo.state.workingTreeChanges, ...repo.state.indexChanges,
+                ...repo.state.mergeChanges, ...(repo.state.untrackedChanges ?? [])].map(change => path.normalize(change.uri.fsPath)));
+            if (message.action !== 'refresh' && files.some(file => !known.has(path.normalize(file)))) throw new Error('The selection has changed. Refresh and select the files again.');
+            await this.contextActions.execute(message.action, repo, files, message.folder);
+        } finally {
+            try {
+                if (mutates.has(message.action) || message.action === 'refresh') {
+                    await repo.status();
+                    await this.refresh();
+                }
+            } finally {
+                this.contextOperations.delete(root);
+            }
+        }
+    }
+
+    private async openContextDiff(repo: Repository, file: string): Promise<void> {
+        const working = [...repo.state.workingTreeChanges, ...repo.state.mergeChanges, ...(repo.state.untrackedChanges ?? [])]
+            .find(change => change.uri.fsPath === file);
+        const change = working ?? repo.state.indexChanges.find(change => change.uri.fsPath === file);
+        if (working?.status === Status.DELETED) {
+            const empty = await vscode.workspace.openTextDocument({ content: '' });
+            await vscode.commands.executeCommand('vscode.diff', this.api!.toGitUri(vscode.Uri.file(file), '~'), empty.uri,
+                `${path.basename(file)} (Deleted)`);
+        } else if (change) {
+            await this.handle({ type: 'diff', repo: repo.rootUri.fsPath, file, staged: !working, status: change.status });
         }
     }
 
@@ -571,7 +674,7 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
             const relativePaths = trackedFiles.map(file => path.relative(root, file));
             await execFileAsync(
                 'git',
-                ['restore', '--source=HEAD', '--staged', '--worktree', '--', ...relativePaths],
+                ['--literal-pathspecs', 'restore', '--source=HEAD', '--staged', '--worktree', '--', ...relativePaths],
                 { cwd: root, maxBuffer: 10 * 1024 * 1024 }
             );
         }
@@ -619,11 +722,10 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
         const targetRepo = repo;
 
         try {
-            const { stdout } = await execFileAsync(
-                'git',
-                ['for-each-ref', '--format=%(refname:short)', 'refs/heads/'],
-                { cwd: targetRepo.rootUri.fsPath }
-            );
+            const [{ stdout }, { stdout: remoteStdout }] = await Promise.all([
+                execFileAsync('git', ['for-each-ref', '--format=%(refname:short)', 'refs/heads/'], { cwd: targetRepo.rootUri.fsPath }),
+                execFileAsync('git', ['for-each-ref', '--format=%(refname:short)|%(symref)', 'refs/remotes/'], { cwd: targetRepo.rootUri.fsPath })
+            ]);
 
             const current = targetRepo.state.HEAD?.name;
             const branches = parseLocalBranches(stdout);
@@ -631,12 +733,13 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
             const createLabel = '$(add) Create new branch…';
             const picked = await vscode.window.showQuickPick(
                 [
-                    { label: createLabel, branch: undefined as string | undefined },
+                    { label: createLabel, branch: undefined as string | undefined, remote: false },
                     ...branches.map(branch => ({
                         label: branch === current ? `$(check) ${branch}` : branch,
                         description: branch === current ? 'current branch' : undefined,
-                        branch
-                    }))
+                        branch, remote: false
+                    })),
+                    ...parseRemoteBranches(remoteStdout).map(branch => ({ label: branch, description: 'remote', branch, remote: true }))
                 ],
                 { placeHolder: `Switch branch — ${path.basename(targetRepo.rootUri.fsPath)}` }
             );
@@ -653,6 +756,10 @@ class BetterGitViewProvider implements vscode.WebviewViewProvider, vscode.Dispos
                 if (!name?.trim()) return;
 
                 await execFileAsync('git', ['switch', '-c', name.trim()], { cwd: targetRepo.rootUri.fsPath });
+            } else if (picked.remote) {
+                const { remote, branch } = splitRemoteBranch(picked.branch);
+                await this.handleBranchAction(targetRepo.rootUri.fsPath, 'checkoutRemote', undefined, remote, branch);
+                return;
             } else if (picked.branch !== current) {
                 await execFileAsync('git', ['switch', picked.branch], { cwd: targetRepo.rootUri.fsPath });
             } else {

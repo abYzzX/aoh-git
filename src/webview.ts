@@ -1,6 +1,7 @@
 import type * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
-import { gitStatusClasses } from './gitStatus';
+import { gitStatusClasses, Status } from './gitStatus';
+import { rootContextMenu, gitContextMenu, visibleMenu } from './contextMenu';
 
 export function renderWebview(webview: vscode.Webview): string {
         const nonce = getNonce();
@@ -65,7 +66,11 @@ body {
 .context-menu {
     position: fixed;
     z-index: 10000;
-    min-width: 170px;
+    min-width: min(210px, calc(100vw - 12px));
+    width: max-content;
+    max-width: calc(100vw - 12px);
+    max-height: calc(100vh - 12px);
+    overflow: auto;
     padding: 4px 0;
     border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border));
     border-radius: 4px;
@@ -75,14 +80,27 @@ body {
 }
 .context-menu.hidden { display: none; }
 .context-menu-item {
-    padding: 5px 24px 5px 10px;
-    white-space: nowrap;
+    display: block;
+    width: 100%;
+    min-height: 25px;
+    padding: 4px 24px 4px 10px;
+    border: 0;
+    border-radius: 0;
+    text-align: left;
+    font: inherit;
+    background: transparent;
+    color: inherit;
+    white-space: normal;
     cursor: default;
 }
-.context-menu-item:hover {
+.context-menu-item:not(:disabled):hover, .context-menu-item:focus-visible {
     background: var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground));
     color: var(--vscode-menu-selectionForeground, var(--vscode-foreground));
 }
+
+.context-menu-item:disabled { opacity: .5; background: transparent; }
+.context-menu-separator { height: 1px; margin: 4px 8px; background: var(--vscode-menu-separatorBackground, var(--vscode-widget-border)); }
+.context-menu-arrow { float: right; margin-left: 12px; }
 
 .branch-menu {
     position: absolute;
@@ -407,6 +425,33 @@ body {
     background: var(--vscode-sideBar-background);
     padding: 10px;
 }
+.message-actions {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+button.commit-history-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    min-height: 24px;
+    padding: 0;
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+}
+button.commit-history-button:hover:not(:disabled) {
+    background: var(--vscode-toolbar-hoverBackground);
+    color: var(--vscode-foreground);
+}
+button.commit-history-button:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 1px;
+}
 .message-wrap {
     position: relative;
 }
@@ -416,7 +461,7 @@ textarea {
     min-height: 82px;
     max-height: 180px;
     resize: vertical;
-    padding: 8px 38px 8px 9px;
+    padding: 8px 66px 8px 9px;
     border: 1px solid var(--vscode-input-border, transparent);
     border-radius: 3px;
     background: var(--vscode-input-background);
@@ -426,9 +471,6 @@ textarea {
 }
 textarea:focus { border-color: var(--vscode-focusBorder); }
 .ai-button {
-    position: absolute;
-    top: 6px;
-    right: 6px;
     width: 26px;
     height: 26px;
     min-height: 0;
@@ -496,11 +538,20 @@ button:disabled { opacity: .55; cursor: default; }
     <div class="commit-area">
         <div class="message-wrap">
             <textarea id="message" placeholder="Commit message (Ctrl+Enter to commit)"></textarea>
-            <button
-                id="generateCommitMessage"
-                class="ai-button"
-                title="Generate commit message with AI"
-                aria-label="Generate commit message with AI">✦</button>
+            <div class="message-actions">
+                <button id="recentCommitMessages" class="commit-history-button" type="button" disabled
+                    title="Recent Commit Messages" aria-label="Recent Commit Messages">
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true" focusable="false">
+                        <circle cx="8" cy="8" r="6"></circle>
+                        <path d="M8 4.5V8l2.5 1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+                    </svg>
+                </button>
+                <button
+                    id="generateCommitMessage"
+                    class="ai-button"
+                    title="Generate commit message with AI"
+                    aria-label="Generate commit message with AI">✦</button>
+            </div>
         </div>
         <div class="buttons">
             <button id="commit" class="secondary">Commit</button>
@@ -508,18 +559,23 @@ button:disabled { opacity: .55; cursor: default; }
         </div>
     </div>
 </div>
-<div id="contextMenu" class="context-menu hidden">
-  <div id="rollbackContext" class="context-menu-item">Rollback</div>
-</div>
+<div id="contextMenu" class="context-menu hidden" role="menu" aria-label="Changes"></div>
+<div id="gitContextMenu" class="context-menu hidden" role="menu" aria-label="Git"></div>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 const repos = document.getElementById('repos');
 const message = document.getElementById('message');
+const recentCommitMessages = document.getElementById('recentCommitMessages');
+let commitMessageHistoryOpen = false;
 const commit = document.getElementById('commit');
 const commitPush = document.getElementById('commitPush');
 const generateCommitMessage = document.getElementById('generateCommitMessage');
 const contextMenu = document.getElementById('contextMenu');
-const rollbackContext = document.getElementById('rollbackContext');
+const gitContextMenu = document.getElementById('gitContextMenu');
+const rootMenuItems = ${JSON.stringify(rootContextMenu)};
+const gitMenuItems = ${JSON.stringify(gitContextMenu)};
+const visibleMenu = ${visibleMenu.toString()};
+let contextFocus = null;
 const changesTab = document.getElementById('changesTab');
 const stashesTab = document.getElementById('stashesTab');
 const commitArea = document.querySelector('.commit-area');
@@ -546,6 +602,7 @@ function updateButtons() {
     const repo = repoForCommit();
     const committing = !!repo && committingRepos.has(repo.root);
     const generating = !!repo && generatingRepos.has(repo.root);
+    recentCommitMessages.disabled = !repo || committing || commitMessageHistoryOpen;
     commit.disabled = !repo || committing;
     commitPush.disabled = !repo || committing;
     generateCommitMessage.style.display = state.aiEnabled ? '' : 'none';
@@ -598,26 +655,119 @@ function repoForCommit() {
     return state.repositories.find(r => r.root === activeRepo) ?? state.repositories[0];
 }
 
-function hideContextMenu() {
+function hideContextMenu(restoreFocus = false) {
     contextMenu.classList.add('hidden');
+    hideGitContextMenu();
     contextTarget = null;
+    if (restoreFocus && contextFocus?.isConnected) contextFocus.focus();
 }
 
-function showRollbackMenu(event, repo, files) {
+function hideGitContextMenu() {
+    gitContextMenu.classList.add('hidden');
+    contextMenu.querySelector('[data-submenu="git"]')?.setAttribute('aria-expanded', 'false');
+}
+
+function menuHtml(items) {
+    return items.map(item => item.separator
+      ? '<div class="context-menu-separator" role="separator"></div>'
+      : '<button type="button" role="menuitem" class="context-menu-item" ' +
+        (item.disabled ? 'disabled title="' + esc(item.disabled) + '" ' : '') +
+        (item.submenu ? 'data-submenu="git" aria-haspopup="menu" aria-expanded="false"' : 'data-action="' + esc(item.action) + '"') +
+        '>' + esc(item.label) + (item.submenu ? '<span class="context-menu-arrow">›</span>' : '') + '</button>'
+    ).join('');
+}
+
+function positionMenu(menu, x, y) {
+    menu.classList.remove('hidden');
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = Math.max(6, Math.min(x, window.innerWidth - rect.width - 6)) + 'px';
+    menu.style.top = Math.max(6, Math.min(y, window.innerHeight - rect.height - 6)) + 'px';
+}
+
+function showContextMenu(event, repoRoot, files, folder) {
     event.preventDefault();
     event.stopPropagation();
-    if (!files?.length) return;
-
-    contextTarget = { repo, files };
-    contextMenu.classList.remove('hidden');
-
-    const margin = 6;
-    const rect = contextMenu.getBoundingClientRect();
-    const left = Math.min(event.clientX, window.innerWidth - rect.width - margin);
-    const top = Math.min(event.clientY, window.innerHeight - rect.height - margin);
-    contextMenu.style.left = Math.max(margin, left) + 'px';
-    contextMenu.style.top = Math.max(margin, top) + 'px';
+    const repo = state.repositories.find(repo => repo.root === repoRoot);
+    if (!repo || !files.length) return;
+    hideContextMenu();
+    contextFocus = event.currentTarget;
+    if (!folder && files.length === 1 && isSelected(repoRoot, files[0])) files = selectedForRepo(repoRoot);
+    const untracked = new Set(repo.untracked.map(file => file.file));
+    const kind = files.every(file => untracked.has(file)) ? 'untracked'
+      : files.every(file => !untracked.has(file)) ? 'tracked' : 'mixed';
+    contextTarget = { repo: repoRoot, files, folder };
+    contextMenu.innerHTML = menuHtml(visibleMenu(rootMenuItems, kind));
+    gitContextMenu.innerHTML = menuHtml(gitMenuItems);
+    const anchor = event.currentTarget.getBoundingClientRect();
+    positionMenu(contextMenu, event.clientX || anchor.left, event.clientY || anchor.bottom);
+    contextMenu.querySelector('button:not(:disabled)')?.focus();
 }
+
+function openGitContextMenu(focus = false) {
+    const trigger = contextMenu.querySelector('[data-submenu="git"]');
+    if (!trigger || !contextTarget) return;
+    const rect = trigger.getBoundingClientRect();
+    gitContextMenu.classList.remove('hidden');
+    const width = gitContextMenu.getBoundingClientRect().width;
+    positionMenu(gitContextMenu, rect.right + width + 6 <= window.innerWidth ? rect.right : rect.left - width, rect.top);
+    trigger.setAttribute('aria-expanded', 'true');
+    if (focus) gitContextMenu.querySelector('button:not(:disabled)')?.focus();
+}
+
+function runContextAction(action) {
+    if (!contextTarget) return;
+    const target = contextTarget;
+    hideContextMenu();
+    activeRepo = target.repo;
+    if (action === 'commit') {
+        selectedFiles.set(target.repo, new Set(target.files));
+        initializedRepos.add(target.repo);
+        activeTab = 'changes';
+        render();
+        syncVisibleChecks(target.repo);
+        message.focus();
+    } else if (action === 'unstash') {
+        activeTab = 'stashes';
+        render();
+        [...repos.querySelectorAll('.repo')].find(el => el.dataset.repo === target.repo)?.scrollIntoView({ block: 'nearest' });
+    } else {
+        vscode.postMessage({ type: 'contextAction', action, ...target });
+    }
+}
+
+for (const menu of [contextMenu, gitContextMenu]) {
+    menu.addEventListener('click', event => {
+        event.stopPropagation();
+        const button = event.target.closest('button');
+        if (!button || button.disabled) return;
+        if (button.dataset.submenu) openGitContextMenu(true);
+        else runContextAction(button.dataset.action);
+    });
+    menu.addEventListener('keydown', event => {
+        const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
+        const index = buttons.indexOf(document.activeElement);
+        if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+            event.preventDefault();
+            const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+              : (index + (event.key === 'ArrowUp' ? -1 : 1) + buttons.length) % buttons.length;
+            buttons[next]?.focus();
+        } else if (event.key === 'ArrowRight' && document.activeElement?.dataset.submenu) {
+            event.preventDefault(); openGitContextMenu(true);
+        } else if (event.key === 'ArrowLeft' && menu === gitContextMenu) {
+            event.preventDefault(); hideGitContextMenu();
+            contextMenu.querySelector('[data-submenu="git"]')?.focus();
+        } else if (event.key === 'Escape' || event.key === 'Tab') {
+            event.preventDefault(); event.stopPropagation(); hideContextMenu(true);
+        }
+    });
+}
+contextMenu.addEventListener('pointerover', event => {
+    if (event.target.closest('[data-submenu="git"]')) openGitContextMenu();
+    else if (event.target.closest('button')) hideGitContextMenu();
+});
+contextMenu.addEventListener('scroll', hideGitContextMenu);
+window.addEventListener('resize', () => hideContextMenu());
+repos.addEventListener('scroll', () => hideContextMenu());
 
 function initializeSelection(repo) {
     const visible = new Set([...(repo.tracked || []), ...(repo.untracked || [])].map(file => file.file));
@@ -867,11 +1017,21 @@ function createStash(repo) {
 }
 
 function bindChangeEvents(scope) {
+    scope.querySelectorAll('.file-row, .tree-folder > summary').forEach(el => {
+        el.addEventListener('keydown', event => {
+            if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) {
+                event.preventDefault();
+                event.stopPropagation();
+                const rect = el.getBoundingClientRect();
+                el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: rect.left, clientY: rect.bottom }));
+            }
+        });
+    });
     scope.querySelectorAll('.file-row').forEach(el => {
         el.addEventListener('contextmenu', event => {
             const file = el.querySelector('.file-main');
             if (!file) return;
-            showRollbackMenu(event, file.dataset.repo, [file.dataset.file]);
+            showContextMenu(event, file.dataset.repo, [file.dataset.file]);
         });
     });
 
@@ -880,7 +1040,7 @@ function bindChangeEvents(scope) {
             const input = el.querySelector('.folder-check');
             if (!input) return;
             const files = JSON.parse(input.dataset.files || '[]');
-            showRollbackMenu(event, input.dataset.repo, files);
+            showContextMenu(event, input.dataset.repo, files, input.dataset.folder);
         });
     });
 
@@ -1089,7 +1249,7 @@ function folderThemeIcons(name) {
 
 function renderFileRow(repo, file, treeFile) {
     const statusClass = gitStatusClass(file.status);
-    return '<div class="file-row' + (treeFile ? ' tree-file' : '') + (statusClass ? ' ' + statusClass : '') + '" title="' + esc(file.tooltip) + '">' +
+    return '<div tabindex="0" class="file-row' + (treeFile ? ' tree-file' : '') + (statusClass ? ' ' + statusClass : '') + '" title="' + esc(file.tooltip) + '">' +
       '<input class="file-check" type="checkbox" ' + (isSelected(repo.root, file.file) ? 'checked ' : '') +
         'data-repo="' + esc(repo.root) + '" data-file="' + esc(file.file) + '">' +
       fileThemeIcon(file) +
@@ -1133,7 +1293,7 @@ function renderTree(repo, files, group) {
               '<summary>' +
                 '<input class="folder-check" type="checkbox" ' + selectionAttrs(repo.root, descendants) +
                   'title="Select folder"' +
-                  'data-repo="' + esc(repo.root) + '" data-files="' + filesJson + '">' +
+                  'data-repo="' + esc(repo.root) + '" data-files="' + filesJson + '" data-folder="' + esc(childParts.join('/')) + '">' +
                 folderThemeIcons(name) +
                 '<span>' + esc(name) + '</span>' +
               '</summary>' +
@@ -1166,6 +1326,14 @@ function doCommit(push) {
     });
 }
 
+recentCommitMessages.addEventListener('click', () => {
+    const repo = repoForCommit();
+    if (!repo || recentCommitMessages.disabled) return;
+    commitMessageHistoryOpen = true;
+    updateButtons();
+    vscode.postMessage({ type: 'selectCommitMessage', repo: repo.root });
+});
+
 generateCommitMessage.addEventListener('click', () => {
     const repo = repoForCommit();
     if (!repo || generateCommitMessage.disabled) return;
@@ -1181,14 +1349,6 @@ generateCommitMessage.addEventListener('click', () => {
 
 commit.addEventListener('click', () => doCommit(false));
 commitPush.addEventListener('click', () => doCommit(true));
-
-rollbackContext.addEventListener('click', event => {
-    event.stopPropagation();
-    if (!contextTarget) return;
-    const target = contextTarget;
-    hideContextMenu();
-    vscode.postMessage({ type: 'rollback', repo: target.repo, files: target.files });
-});
 
 message.addEventListener('keydown', e => {
     if (e.key === 'Enter' && e.ctrlKey) {
@@ -1213,6 +1373,7 @@ window.addEventListener('message', event => {
     const data = event.data;
     if (data.type === 'state') {
         debug('State received. repositories=' + (data.repositories?.length ?? 0) + ', viewMode=' + data.viewMode);
+        hideContextMenu();
         state = data;
         const iconFontStyle = document.getElementById('file-icon-theme-fonts');
         if (iconFontStyle) iconFontStyle.textContent = state.fileIconTheme?.css || '';
@@ -1229,6 +1390,15 @@ window.addEventListener('message', event => {
     } else if (data.type === 'generatedCommitMessage') {
         if (activeRepo === data.repo || state.repositories.length === 1) {
             message.value = data.message || '';
+            message.focus();
+            message.setSelectionRange(message.value.length, message.value.length);
+        }
+    } else if (data.type === 'commitMessageHistoryFinished') {
+        commitMessageHistoryOpen = false;
+        updateButtons();
+    } else if (data.type === 'commitMessageSelected') {
+        if (repoForCommit()?.root === data.repo) {
+            message.value = data.message;
             message.focus();
             message.setSelectionRange(message.value.length, message.value.length);
         }

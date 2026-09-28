@@ -11,6 +11,7 @@ export interface Change {
 }
 
 export interface Branch {
+    readonly commit?: string;
     readonly name?: string;
     readonly upstream?: { remote: string; name: string };
     readonly ahead?: number;
@@ -33,6 +34,12 @@ export interface Repository {
     restore(paths: string[], options?: { staged?: boolean; ref?: string }): Promise<void>;
     commit(message: string, opts?: { all?: boolean | 'tracked'; postCommitCommand?: string | null }): Promise<void>;
     push(remoteName?: string, branchName?: string, setUpstream?: boolean): Promise<void>;
+    log(options?: { maxEntries?: number; path?: string }): Promise<Array<{ hash: string; message: string }>>;
+    merge(ref: string): Promise<void>;
+    tag(name: string, message: string): Promise<void>;
+    addRemote(name: string, url: string): Promise<void>;
+    removeRemote(name: string): Promise<void>;
+    renameRemote(name: string, newName: string): Promise<void>;
     status(): Promise<void>;
 }
 
