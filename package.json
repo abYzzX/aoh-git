@@ -4,19 +4,19 @@
   "description": "AOH - Rider-inspired Git workflow for VS Code.",
   "version": "0.0.0",
   "publisher": "AbYzzX",
-  "icon": "media/aoh-git-icon.png",
+  "icon": "media/aoh-git.png",
   "license": "MIT",
     "repository": {
     "type": "git",
-    "url": "https://github.com/Abyzz/aoh-git.git"
+    "url": "https://github.com/abYzzX/aoh-git.git"
   },
   "bugs": {
-    "url": "https://github.com/Abyzz/aoh-git/issues"
+    "url": "https://github.com/abYzzX/aoh-git/issues"
   },
-  "homepage": "https://github.com/Abyzz/aoh-git#readme",
+  "homepage": "https://github.com/abYzzX/aoh-git#readme",
   "engines": {
     "vscode": "^1.96.0"
-  },  
+  },
   "categories": [
     "Other"
   ],

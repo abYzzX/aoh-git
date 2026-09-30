@@ -2,6 +2,11 @@
 
 All notable changes to AOH - Git will be documented in this file.
 
+## 0.1.5
+
+- Fix GitHub links
+- Update icon
+
 ## 0.1.4
 
 - Restore the clock-icon button beside AI in the commit message box to reuse complete recent commit messages.
